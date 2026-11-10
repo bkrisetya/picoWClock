@@ -40,6 +40,13 @@ orange = display.create_pen(255, 128, 0)
 
 led_onboard = machine.Pin('LED', machine.Pin.OUT, value=0)
 
+# The pack's RGB LED is common-anode. Left unconfigured, the GPIO pull-downs
+# sink enough current to make the red die glow, so drive it explicitly off.
+from pimoroni import RGBLED
+
+rgb_led = RGBLED(6, 7, 8)
+rgb_led.set_rgb(0, 0, 0)
+
 display.set_pen(black)
 display.clear()
 display.update()
@@ -51,8 +58,20 @@ def wifi_connected():
     return wlan.isconnected()
 
 
-def connect_wifi(timeout_s=15):
-    """Best-effort connect. Returns True on success."""
+def known_networks():
+    """(ssid, psk) pairs from WIFI_CONFIG: NETWORKS list, or legacy SSID/PSK."""
+    nets = getattr(WIFI_CONFIG, 'NETWORKS', None)
+    if nets:
+        return list(nets)
+    return [(WIFI_CONFIG.SSID, WIFI_CONFIG.PSK)]
+
+
+def connect_wifi(timeout_s=15, show=False):
+    """Join whichever known network is in range. Returns True on success.
+
+    show=True paints a status screen (boot only); background retries stay
+    silent so the clock face is never blanked.
+    """
     try:
         import rp2
         rp2.country(WIFI_CONFIG.COUNTRY)
@@ -61,20 +80,30 @@ def connect_wifi(timeout_s=15):
     wlan = network.WLAN(network.STA_IF)
     if wlan.isconnected():
         return True
-    display.set_pen(black)
-    display.clear()
-    display.set_pen(white)
-    display.text('Connecting WiFi...', 8, 56, width, 0.9)
-    display.update()
+    if show:
+        display.set_pen(black)
+        display.clear()
+        draw_centred('WiFi', (height - 32) // 2, 4, white)
+        display.update()
     wlan.active(True)
-    wlan.connect(WIFI_CONFIG.SSID, WIFI_CONFIG.PSK)
-    for _ in range(timeout_s):
-        if wlan.status() < 0 or wlan.status() >= 3:
-            break
-        led_onboard.toggle()
-        time.sleep(1)
-    led_onboard.off()
-    return wlan.isconnected()
+    nets = known_networks()
+    try:
+        visible = [s[0].decode('utf-8', 'replace') for s in wlan.scan()]
+        nets = [n for n in nets if n[0] in visible]
+    except OSError:
+        pass  # scan failed: try every known network
+    for ssid, psk in nets:
+        wlan.connect(ssid, psk)
+        for _ in range(timeout_s):
+            if wlan.status() < 0 or wlan.status() >= 3:
+                break
+            led_onboard.toggle()
+            time.sleep(1)
+        led_onboard.off()
+        if wlan.isconnected():
+            return True
+        wlan.disconnect()
+    return False
 
 
 # ---------------- NTP ----------------
@@ -161,7 +190,7 @@ def draw_clock():
 
 # ---------------- startup ----------------
 synced = False
-wifi_ok = connect_wifi()
+wifi_ok = connect_wifi(show=True)
 if wifi_ok:
     synced = ntp_set_rtc()
 
@@ -172,15 +201,19 @@ while True:
     draw_clock()
 
     now = time.time()
-    if not wifi_connected() and now - last_retry > RETRY_EVERY_S:
-        last_retry = now
-        led_onboard.toggle()
-        if connect_wifi(8):
+    if not wifi_connected():
+        if now - last_retry > RETRY_EVERY_S:
+            last_retry = now
+            if connect_wifi(8):
+                synced = ntp_set_rtc()
+                last_sync = time.time()
+    elif not synced:
+        if now - last_retry > RETRY_EVERY_S:
+            last_retry = now
             synced = ntp_set_rtc()
             last_sync = time.time()
-        led_onboard.off()
-    elif wifi_connected() and synced and now - last_sync > RESYNC_EVERY_S:
+    elif now - last_sync > RESYNC_EVERY_S:
         if ntp_set_rtc():
-            last_sync = now
+            last_sync = time.time()
 
     time.sleep(1)

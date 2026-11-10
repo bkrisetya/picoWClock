@@ -1,4 +1,7 @@
 # Example WiFi config. Copy to WIFI_CONFIG.py and fill in your values.
-SSID = 'YOURWIFISSIDHERE'
-PSK = 'YOURPASSWORDHERE'
+# The clock scans and joins whichever listed network is in range.
+NETWORKS = [
+    ('HOME-SSID', 'HOME-PASSWORD'),
+    ('WORK-SSID', 'WORK-PASSWORD'),
+]
 COUNTRY = 'GB'
