@@ -1,0 +1,4 @@
+# Example WiFi config. Copy to WIFI_CONFIG.py and fill in your values.
+SSID = 'YOURWIFISSIDHERE'
+PSK = 'YOURPASSWORDHERE'
+COUNTRY = 'GB'
