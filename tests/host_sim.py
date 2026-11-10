@@ -270,6 +270,7 @@ class PicoGraphics:
         self.w, self.h = 135, 240
         self.pen = None
         self.ops = []
+        self.rects = []
         self.bg = None
 
     def get_bounds(self):
@@ -291,6 +292,7 @@ class PicoGraphics:
     def clear(self):
         self.bg = self.pen
         self.ops = []
+        self.rects = []
 
     def measure_text(self, text, scale):
         # Real bitmap8 metrics recorded from the board (tests/bitmap8_widths.json).
@@ -304,11 +306,13 @@ class PicoGraphics:
 
     def rectangle(self, x, y, w, h):
         assert x >= 0 and y >= 0 and x + w <= self.w and y + h <= self.h, (x, y, w, h)
+        self.rects.append((x, y, w, h, self.pen))
 
     def update(self):
         if 'update' in display_fault:
             raise RuntimeError(display_fault.pop('update'))
-        frames.append({'bg': self.bg, 'ops': list(self.ops), 't': clock.elapsed_ms})
+        frames.append({'bg': self.bg, 'ops': list(self.ops), 'rects': list(self.rects),
+                       't': clock.elapsed_ms})
 
 
 picographics = types.ModuleType('picographics')
@@ -436,11 +440,11 @@ def scenario():
 
     # X: timer shows READY 25:00 without starting.
     press(X)
-    assert texts() == ['FOCUS', '25', '00', 'READY'], texts()
+    assert texts() == ['FOCUS', '25:00', 'READY'], texts()
     # X again starts; after 10 s it reads 24:50 and stays on screen past 20 s.
     press(X)
     run_for(10000)
-    assert texts()[:3] == ['FOCUS', '24', '50'], texts()
+    assert texts() == ['FOCUS', '24:50'], texts()
     run_for(30000)
     assert texts()[0] == 'FOCUS', 'running timer must not return to clock'
     checks.append('X start, countdown, no idle return while running')
@@ -449,16 +453,16 @@ def scenario():
     press(X)                       # pause
     edge(X)                        # bounce edge after release, pin already up
     run_for(60)
-    assert texts()[3:] == ['PAUSED'], ('bounce re-toggled the timer', texts())
+    assert texts()[2:] == ['PAUSED'], ('bounce re-toggled the timer', texts())
     press(X)                       # resume
-    assert len(texts()) == 3, ('timer should be running again', texts())
+    assert texts()[0] == 'FOCUS' and len(texts()) == 2, ('timer should be running again', texts())
     checks.append('release bounce ignored, timer toggles once per press')
 
     # A poll landing in a gap of the contact bounce as X goes down sees an
     # edge with the pin up. That must not count as a tap plus a press (it
     # toggled the timer twice on the board: start then pause at once).
     run_for(500)                   # well clear of the last release
-    before = texts()[3:]
+    before = texts()[2:]
     edge(X)                        # first contact, pin bounces back up
     yield_point()                  # exactly one loop pass samples the gap
     button_down[X] = True          # contact settles: held
@@ -466,16 +470,16 @@ def scenario():
     run_for(150)
     button_down[X] = False
     run_for(100)
-    after = texts()[3:]
+    after = texts()[2:]
     assert after != before, ('press bounce toggled the timer twice', before, after)
     press(X)                       # restore the previous state for what follows
-    assert texts()[3:] == before, (before, texts())
+    assert texts()[2:] == before, (before, texts())
     checks.append('press bounce sampled mid-gap toggles the timer once')
 
     # The first poll after a release catching the pin low again (release
     # bounce) must not start a second press: X would toggle twice.
     run_for(500)
-    before = texts()[3:]
+    before = texts()[2:]
     button_down[X] = True
     edge(X)
     run_for(150)
@@ -486,15 +490,15 @@ def scenario():
     yield_point()
     button_down[X] = False
     run_for(300)
-    assert texts()[3:] != before, ('release bounce toggled the timer twice', before, texts())
+    assert texts()[2:] != before, ('release bounce toggled the timer twice', before, texts())
     press(X)                       # back to the previous state
-    assert texts()[3:] == before, (before, texts())
+    assert texts()[2:] == before, (before, texts())
     checks.append('release bounce caught low does not press again')
 
     # Pause holds the value; idle return still applies when paused.
     press(X)
     paused = texts()[:4]
-    assert paused[3] == 'PAUSED', paused
+    assert paused[2] == 'PAUSED', paused
     run_for(25000)
     assert len(texts()) == 2 and texts()[0].isdigit(), 'paused timer returns to clock'
     press(X)   # from clock: shows timer, does not toggle
@@ -503,7 +507,7 @@ def scenario():
 
     # Hold X resets to 25:00 READY.
     press(X, hold_ms=1300)
-    assert texts() == ['FOCUS', '25', '00', 'READY'], texts()
+    assert texts() == ['FOCUS', '25:00', 'READY'], texts()
     checks.append('hold X resets')
 
     # A long X press from another screen only shows the timer: it must not
@@ -511,15 +515,15 @@ def scenario():
     press(X)                       # start
     press(A)
     press(X, hold_ms=1300)
-    assert texts()[0] == 'FOCUS' and len(texts()) == 3, ('hold off-screen reset', texts())
+    assert texts()[0] == 'FOCUS' and len(texts()) == 2, ('hold off-screen reset', texts())
     press(X, hold_ms=1300)         # on the timer screen: resets
-    assert texts() == ['FOCUS', '25', '00', 'READY'], texts()
+    assert texts() == ['FOCUS', '25:00', 'READY'], texts()
     checks.append('hold X resets only on the timer screen')
 
     # Run a full 25 minutes from the clock screen: auto-switch and flash.
     press(X)            # start
     press(A)            # go to clock while it runs
-    assert len(texts()) == 2
+    assert len(texts()) == 2 and texts()[0].isdigit(), texts()
     run_for(25 * 60 * 1000 + 3000)
     assert texts()[0] == 'FOCUS', 'finish switches to timer'
     assert led_rgb[-1] == (0, 90, 80), ('LED glows when the session ends', led_rgb[-3:])
@@ -527,10 +531,10 @@ def scenario():
                  and clock.elapsed_ms - f['t'] < 4000}
     assert 'teal' in flash_bgs and 'black' in flash_bgs, flash_bgs
     run_for(5000)
-    assert texts() == ['FOCUS', '00', '00', 'DONE'], texts()
+    assert texts() == ['FOCUS', '00:00', 'DONE'], texts()
     assert frames[-1]['bg'] == 'black'
     run_for(20000)
-    assert len(texts()) == 2, 'done screen returns to clock'
+    assert len(texts()) == 2 and texts()[0].isdigit(), 'done screen returns to clock'
     assert led_rgb[-1] == (0, 90, 80), 'glow outlasts the screen'
     checks.append('25 min finish: auto-switch, teal flash, DONE, return, LED glow')
 
@@ -538,7 +542,7 @@ def scenario():
     press(X)
     assert led_rgb[-1] == (0, 0, 0), ('a press ends the glow', led_rgb[-3:])
     press(X)
-    assert texts() == ['FOCUS', '25', '00', 'READY'], texts()
+    assert texts() == ['FOCUS', '25:00', 'READY'], texts()
     checks.append('X on DONE resets')
 
     # Weather failure keeps the last good reading until it is 3 h old.
@@ -653,9 +657,9 @@ def scenario():
     jump_to_hour(22)
     assert backlights[-1] == 0.15, ('22:00 dims', backlights[-3:])
     press(X)
-    if texts()[3:] == ['DONE']:
+    if texts()[2:] == ['DONE']:
         press(X)
-    assert texts() == ['FOCUS', '25', '00', 'READY'], texts()
+    assert texts() == ['FOCUS', '25:00', 'READY'], texts()
     press(X)                             # start at night
     clock.elapsed_ms += 25 * 60 * 1000
     run_for(200)
@@ -829,6 +833,27 @@ def main():
             assert label[4] == value[4], 'label and value on one baseline'
             assert label[3] + disp.measure_text(label[0], label[2]) < value[3], (label, value)
     checks.append('weather no-data and cold-night layouts fit, rows aligned')
+
+    # The timer must not read as a clock: one 'MM:SS' line (the clock is two
+    # stacked numbers) and a teal bar that drains with the time left.
+    disp, focus = g['display'], g['focus']
+    full = disp.w - 20
+    for state, secs, want in (('ready', 1500, full), ('running', 750, full // 2 + 1),
+                              ('running', 1, 1), ('done', 0, 0)):
+        focus.state = state
+        disp.set_pen('black')
+        disp.clear()
+        g['draw_timer'](secs, False)
+        nums = [op for op in disp.ops if any(c.isdigit() for c in op[0])]
+        assert len(nums) == 1 and re.match(r'^\d\d:\d\d$', nums[0][0]), disp.ops
+        assert nums[0][2] >= 5, ('countdown must stay large', nums[0])
+        fill = [r[2] for r in disp.rects if r[4] == 'teal']
+        track = [r for r in disp.rects if r[4] == 'dim_teal']
+        assert track and track[0][2] == full and fill == ([want] if want else []), (state, secs, disp.rects)
+    disp.clear()
+    g['draw_clock']((2026, 11, 10, 14, 55, 0, 1), True)
+    assert [op[0] for op in disp.ops] == ['14', '55'] and not disp.rects, disp.ops
+    checks.append('timer is one MM:SS line with a draining bar; clock stays two numbers')
 
     for c in checks:
         print('PASS', c)

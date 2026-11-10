@@ -584,7 +584,7 @@ def draw_band(text, y0, y1, pen, scale):
 
 
 def draw_pair(top, bottom, y0, y1, top_pen, bottom_pen):
-    """Two equal-size rows splitting y0..y1 (clock and timer digits)."""
+    """Two equal-size rows splitting y0..y1 (the clock's digits)."""
     mid = (y0 + y1) // 2
     scale = min(band_scale(top, y0, mid, 15), band_scale(bottom, mid, y1, 15))
     draw_band(top, y0, mid, top_pen, scale)
@@ -610,13 +610,29 @@ def draw_date(tm, synced_time):
     draw_band(month, 176, height, teal, band_scale(month, 176, height, 8))
 
 
-def draw_timer(secs, fg, accent):
+# Timer layout: unlike the clock's two stacked numbers, one 'MM:SS' line
+# with a colon and a bar that drains as the session runs, so a glance can
+# never read a countdown as the time of day.
+TIMER_BAR = (10, 160, 12)   # (side margin, top y, height)
+
+
+def draw_timer(secs, flash):
+    fg, accent = (black, black) if flash else (white, teal)
     label = {'ready': 'READY', 'paused': 'PAUSED', 'done': 'DONE'}.get(focus.state, '')
-    draw_band('FOCUS', 0, 32, accent, band_scale('FOCUS', 0, 32, 3))
-    draw_pair('{:02d}'.format(secs // 60), '{:02d}'.format(secs % 60),
-              32, 212, fg, accent)
+    draw_band('FOCUS', 0, 40, accent, band_scale('FOCUS', 0, 40, 3))
+    digits = '{:02d}:{:02d}'.format(secs // 60, secs % 60)
+    draw_band(digits, 40, 150, fg, band_scale(digits, 40, 150, 6))
+    margin, top, tall = TIMER_BAR
+    full = width - 2 * margin
+    left = (full * secs + FOCUS_MS // 1000 - 1) // (FOCUS_MS // 1000)
+    if not flash:
+        display.set_pen(dim_teal)
+        display.rectangle(margin, top, full, tall)
+    if left:
+        display.set_pen(accent)
+        display.rectangle(margin, top, min(full, left), tall)
     if label:
-        draw_band(label, 212, height, fg, band_scale(label, 212, height, 3))
+        draw_band(label, 190, height, fg, band_scale(label, 190, height, 3))
 
 
 # Weather layout (portrait 135 x 240): big temperature, condition caption,
@@ -716,10 +732,7 @@ def render(screen):
     elif screen == 'date':
         draw_date(tm, synced_time)
     elif screen == 'timer':
-        if timer_flash:
-            draw_timer(secs, black, black)
-        else:
-            draw_timer(secs, white, teal)
+        draw_timer(secs, timer_flash)
     else:
         draw_weather(wx)
     display.update()
