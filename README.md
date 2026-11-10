@@ -5,6 +5,8 @@ Desk clock on a Raspberry Pi Pico 2 W + Pimoroni Display Pack 1.14"
 
 White with a teal accent throughout.
 
+![Clock, date, focus timer and weather screens, captured from the board's framebuffer](docs/screens.png)
+
 - **A** clock (default): hours white on top, minutes teal below, each
   scaled to fill its half of the panel.
 - **B** date: weekday, day number, month.
