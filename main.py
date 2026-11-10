@@ -3,18 +3,23 @@
 # Pack 2.0), rebuilt for the small panel with one screen per button:
 #   A  clock (default): hours white on top, minutes teal below
 #   B  date: weekday, day number, month
-#   X  focus timer, 25 minutes: X again starts or pauses, hold X to reset
+#   X  focus timer, 25 minutes: X again starts or pauses, hold X on the
+#      timer screen to reset; the RGB LED glows when a session finishes
 #   Y  London weather from Open-Meteo (no key): Y again refreshes
-# Other screens fall back to the clock after 20 s without a press, except
-# while the timer runs. UK time (GMT / BST). WiFi networks live in
-# WIFI_CONFIG.py (git-ignored; the owner fills it in).
+# A, B and Y act the moment they go down; X acts on release, because a
+# hold means reset. Other screens fall back to the clock after 20 s without
+# a press, except while the timer runs. The backlight dims at night. UK
+# time (GMT / BST). WiFi networks live in WIFI_CONFIG.py (git-ignored; the
+# owner fills it in).
 #
 # If WiFi or NTP is unreachable the clock keeps running from the RTC and
-# retries in the background instead of hanging or rebooting.
+# retries in the background instead of hanging or rebooting. An unexpected
+# error is written to crash.txt and the board restarts itself.
 
 import gc
 import machine
 import network
+import sys
 import utime as time
 import usocket as socket
 import ustruct as struct
@@ -24,6 +29,14 @@ import WIFI_CONFIG
 gc.enable()
 
 BRIGHTNESS = 0.55
+NIGHT_BRIGHTNESS = 0.15
+NIGHT_HOURS = (22, 7)           # UK local time: dim from 22:00 until 07:00
+# Finished-timer glow on the pack's RGB LED (0-255 per channel), dimmer at
+# night. It stays on until any button is pressed, or GLOW_MAX_MS passes.
+GLOW_RGB = (0, 90, 80)
+GLOW_NIGHT_RGB = (0, 20, 18)
+GLOW_MAX_MS = 30 * 60 * 1000
+CRASH_LOG = 'crash.txt'
 NTP_HOST = 'pool.ntp.org'
 RETRY_EVERY_S = 60
 # Network calls block the loop (a weather fetch takes 1-6 s), so they run
@@ -41,11 +54,15 @@ IDLE_RETURN_MS = 20 * 1000
 FOCUS_MS = 25 * 60 * 1000
 DONE_FLASH_MS = 6 * 1000
 
+# Hourly precipitation_probability is for the hour ending at each stamp,
+# starting with the current hour (already partly over). Slots 1-4 cover
+# the top of this hour to four hours ahead, so whatever the minute they
+# span the whole of the next three hours.
 WEATHER_URL = ('https://api.open-meteo.com/v1/forecast'
                '?latitude=51.5246&longitude=-0.1340'
                '&current=temperature_2m,weather_code,is_day'
-               '&daily=temperature_2m_max,temperature_2m_min,'
-               'precipitation_probability_max'
+               '&hourly=precipitation_probability&forecast_hours=5'
+               '&daily=temperature_2m_max,temperature_2m_min'
                '&timezone=Europe%2FLondon&forecast_days=1')
 WEATHER_EVERY_MS = 15 * 60 * 1000
 WEATHER_RETRY_MS = 2 * 60 * 1000
@@ -193,7 +210,12 @@ def wifi_tick():
 
 # ---------------- NTP ----------------
 def ntp_set_rtc():
-    """Query NTP over UDP and set the RTC to UTC. Returns True on success."""
+    """Query NTP over UDP and set the RTC to UTC. Returns True on success.
+
+    A reply is used only if it is a full server packet (mode 4) from a
+    synchronised server (stratum 1-15, leap indicator not 3) and gives a
+    plausible year. Anything else, such as a short packet or a
+    kiss-of-death (stratum 0, zero timestamp), leaves the RTC alone."""
     query = bytearray(48)
     query[0] = 0x1B
     try:
@@ -207,8 +229,15 @@ def ntp_set_rtc():
             s.close()
     except OSError:
         return False
+    if (len(msg) < 48 or msg[0] & 7 != 4 or msg[0] >> 6 == 3
+            or not 0 < msg[1] < 16):
+        return False
     seconds = struct.unpack('!I', msg[40:44])[0] - 2208988800
+    if seconds < 0:
+        return False
     tm = time.gmtime(seconds)
+    if not MIN_PLAUSIBLE_YEAR <= tm[0] < 2100:
+        return False
     # RTC stays in UTC; local time is derived at render time.
     machine.RTC().datetime((tm[0], tm[1], tm[2], tm[6], tm[3], tm[4], tm[5], 0))
     return True
@@ -237,10 +266,51 @@ def uk_time():
     return time.localtime(now)
 
 
+def is_night(tm):
+    """True between NIGHT_HOURS (UK local). Never before the first sync,
+    when the RTC still reads 2021 and the hour means nothing."""
+    if tm[0] < MIN_PLAUSIBLE_YEAR:
+        return False
+    start, end = NIGHT_HOURS
+    return tm[3] >= start or tm[3] < end
+
+
+backlight = [BRIGHTNESS]
+
+
+def set_brightness(level):
+    if backlight[0] != level:
+        backlight[0] = level
+        display.set_backlight(level)
+
+
+# ---------------- finished-timer glow ----------------
+glow = {'since': None, 'rgb': (0, 0, 0)}
+
+
+def led(rgb):
+    if glow['rgb'] != rgb:
+        glow['rgb'] = rgb
+        rgb_led.set_rgb(*rgb)
+
+
+def glow_tick(night):
+    """Keep the LED at the right level: lit from a finished session until a
+    press or GLOW_MAX_MS, dimmer at night, otherwise off."""
+    if glow['since'] is not None and mono_ms() - glow['since'] > GLOW_MAX_MS:
+        glow['since'] = None
+    if glow['since'] is None:
+        led((0, 0, 0))
+    else:
+        led(GLOW_NIGHT_RGB if night else GLOW_RGB)
+
+
 # ---------------- buttons ----------------
 BUTTONS = [(name, machine.Pin(pin, machine.Pin.IN, machine.Pin.PULL_UP))
            for name, pin in (('A', 12), ('B', 13), ('X', 14), ('Y', 15))]
 DEBOUNCE_MS = 80
+INSTANT = ('A', 'B', 'Y')   # act on press-down; X waits for release (hold)
+SETTLE_MS = 20              # contact bounce lasts a few ms
 pressed_at = {}
 hold_fired = {}
 released_at = {}
@@ -288,37 +358,50 @@ def take_edges(i, now):
 def poll_buttons():
     """Return (name, 'press' | 'hold') events, oldest press first.
 
-    A press fires on release, a hold once after HOLD_MS while still down.
-    A press that began and ended between two polls is recovered from the
-    edge stamps one poll later, unless it is contact bounce within
-    DEBOUNCE_MS of the previous release."""
+    A, B and Y fire as soon as the press begins. X fires on release, so a
+    hold (once, after HOLD_MS while still down) can mean reset instead. A
+    press that began and ended between two polls is recovered from the edge
+    stamps. A press starting within DEBOUNCE_MS of the button's previous
+    release is contact bounce from that release and is ignored, whether
+    the poll saw only its edge or caught the pin low in the middle of it."""
     events = []
     now = mono_ms()
     for i, (name, pin) in enumerate(BUTTONS):
         seen, first, last = take_edges(i, now)
-        if pin.value() == 0:
-            if name not in pressed_at:
-                pressed_at[name] = last if seen else now
-                hold_fired[name] = False
-            elif not hold_fired[name] and now - pressed_at[name] >= HOLD_MS:
-                hold_fired[name] = True
-                events.append((pressed_at[name], name, 'hold'))
-        elif name in pressed_at:
-            start = pressed_at.pop(name)
+        down = pin.value() == 0
+        if name in pressed_at:
+            start = pressed_at[name]
+            if down:
+                if not hold_fired[name] and now - start >= HOLD_MS:
+                    hold_fired[name] = True
+                    events.append((start, name, 'hold'))
+                continue
+            del pressed_at[name]
             released_at[name] = now
-            if not hold_fired.pop(name) and now - start >= 20:
+            held = hold_fired.pop(name)
+            if name not in INSTANT and not held and now - start >= 20:
                 events.append((start, name, 'press'))
-        elif seen:
-            # Pin up, but it fell since the last poll: either a whole tap
-            # made while the loop was busy, or a poll that sampled a gap in
-            # the contact bounce of a press still going down. Mark it down
-            # and let the next poll decide: up again means a tap, down means
-            # a press in progress, and either way it fires once on release.
-            # Edges just after the last release are release bounce.
-            prev = released_at.get(name)
-            if prev is None or first - prev > DEBOUNCE_MS:
-                pressed_at[name] = first
-                hold_fired[name] = False
+            continue
+        if not (down or seen):
+            continue
+        start = first if seen else now
+        prev = released_at.get(name)
+        if prev is not None and start - prev <= DEBOUNCE_MS:
+            continue
+        if not down and now - last > SETTLE_MS:
+            # Pin up and no falling edge for SETTLE_MS: a whole tap made
+            # while the loop was busy, over already.
+            released_at[name] = now
+            events.append((start, name, 'press'))
+            continue
+        # Pressed now, or pin up just after an edge, which may be a poll
+        # sampling a gap in the contact bounce of a press still going down.
+        # Mark it down; the next poll sees the release (X fires then) or the
+        # button still held, so one press never fires twice.
+        pressed_at[name] = start
+        hold_fired[name] = False
+        if name in INSTANT:
+            events.append((start, name, 'press'))
     events.sort(key=lambda e: e[0])
     return [(name, kind) for _t, name, kind in events]
 
@@ -394,7 +477,8 @@ def condition_name(code, is_day=1):
 
 
 def fetch_weather():
-    """(temp, code, high, low, rain_pct, is_day) for London, or None."""
+    """(temp, code, high, low, rain_pct, is_day) for London, or None.
+    rain_pct is the highest hourly chance over the next three hours."""
     try:
         import urequests
         gc.collect()
@@ -407,7 +491,9 @@ def fetch_weather():
             r.close()
         cur = d['current']
         day = d['daily']
-        rain = day['precipitation_probability_max'][0]
+        hours = [p for p in d['hourly']['precipitation_probability'][1:5]
+                 if p is not None]
+        rain = max(hours) if hours else None
         return (round(cur['temperature_2m']), int(cur['weather_code']),
                 round(day['temperature_2m_max'][0]),
                 round(day['temperature_2m_min'][0]),
@@ -525,6 +611,7 @@ WX_DIVIDER_Y = 118
 WX_ROWS_Y = (138, 173, 208)
 WX_ROW_BAND = 16
 WX_ROW_MAX_SCALE = 2   # 3 cannot fit 'High' and '10°C' with a readable gap
+# 'Rain 3h' plus '100%' is the widest row: 112 of 115 px at scale 2.
 
 
 def degrees_c(value):
@@ -558,7 +645,7 @@ def draw_weather(data):
         caption = condition_name(code, is_day)
     rows = (('High', degrees_c(high)),
             ('Low', degrees_c(low)),
-            ('Rain', '--' if rain is None else '{}%'.format(rain)))
+            ('Rain 3h', '--' if rain is None else '{}%'.format(rain)))
 
     draw_slot(degrees_c(temp), WX_HERO, white)
     draw_slot(caption, WX_CAPTION, teal)
@@ -584,6 +671,9 @@ def render(screen):
     global last_frame
     tm = uk_time()
     synced_time = tm[0] >= MIN_PLAUSIBLE_YEAR
+    night = is_night(tm)
+    set_brightness(NIGHT_BRIGHTNESS if night else BRIGHTNESS)
+    glow_tick(night)
     secs = (focus.remaining() + 999) // 1000
     flash_on = focus.flashing() and (mono_ms() // 500) % 2 == 0
     wx = current_weather()
@@ -616,65 +706,95 @@ def render(screen):
     display.update()
 
 
-# ---------------- startup ----------------
-synced = False
-wifi_ok = connect_wifi(show=True)
-if wifi_ok:
-    synced = ntp_set_rtc()
+# ---------------- crash guard ----------------
+def log_crash(e):
+    """Keep the latest unexpected error (overwritten, so it stays small)."""
+    try:
+        with open(CRASH_LOG, 'w') as f:
+            t = uk_time()
+            f.write('{:02d}/{:02d}/{} {:02d}:{:02d}:{:02d} UK, uptime {} s\n'.format(
+                t[2], t[1], t[0], t[3], t[4], t[5], mono_ms() // 1000))
+            sys.print_exception(e, f)
+    except Exception:
+        pass
 
-last_retry = time.time()
-last_sync = time.time()
-last_net = mono_ms()
-wifi_up = wifi_ok
-# Count boot as quiet so the first network tick (weather) runs at once.
-last_input = mono_ms() - NET_QUIET_MS
-screen = 'clock'
 
-while True:
-    for name, kind in poll_buttons():
-        last_input = mono_ms()
-        if name == 'A':
-            screen = 'clock'
-        elif name == 'B':
-            screen = 'date'
-        elif name == 'X':
-            if kind == 'hold':
-                focus.reset()
-            elif screen == 'timer':
-                focus.toggle()
+# Everything below runs inside the guard. An unexpected error would
+# otherwise leave the last frame frozen on the panel (a wrong time) until
+# someone power-cycles the board, so log it and restart instead. Ctrl-C at
+# the REPL is a KeyboardInterrupt (BaseException) and still gets through.
+try:
+    # ---------------- startup ----------------
+    synced = False
+    wifi_ok = connect_wifi(show=True)
+    if wifi_ok:
+        synced = ntp_set_rtc()
+
+    last_retry = time.time()
+    last_sync = time.time()
+    last_net = mono_ms()
+    wifi_up = wifi_ok
+    # Count boot as quiet so the first network tick (weather) runs at once.
+    last_input = mono_ms() - NET_QUIET_MS
+    screen = 'clock'
+
+    while True:
+        for name, kind in poll_buttons():
+            last_input = mono_ms()
+            glow['since'] = None    # any press acknowledges a finished session
+            if name == 'A':
+                screen = 'clock'
+            elif name == 'B':
+                screen = 'date'
+            elif name == 'X':
+                # A hold resets only where you can see the timer: from
+                # another screen it just shows it, so a long press cannot
+                # wipe a running session unseen.
+                if kind == 'hold':
+                    if screen == 'timer':
+                        focus.reset()
+                elif screen == 'timer':
+                    focus.toggle()
+                screen = 'timer'
+            elif name == 'Y':
+                if screen == 'weather' and kind == 'press':
+                    request_weather()
+                screen = 'weather'
+
+        if focus.update():
             screen = 'timer'
-        elif name == 'Y':
-            if screen == 'weather' and kind == 'press':
-                request_weather()
-            screen = 'weather'
+            last_input = mono_ms()
+            glow['since'] = mono_ms()
 
-    if focus.update():
-        screen = 'timer'
-        last_input = mono_ms()
+        if (screen != 'clock'
+                and not (screen == 'timer' and focus.state == 'running')
+                and mono_ms() - last_input > IDLE_RETURN_MS):
+            screen = 'clock'
 
-    if (screen != 'clock'
-            and not (screen == 'timer' and focus.state == 'running')
-            and mono_ms() - last_input > IDLE_RETURN_MS):
-        screen = 'clock'
+        render(screen)
 
-    render(screen)
+        if mono_ms() - last_net >= 1000 and mono_ms() - last_input >= NET_QUIET_MS:
+            last_net = mono_ms()
+            now = time.time()
+            up = wifi_tick()
+            if up and not wifi_up:
+                last_retry = 0          # link just came back: sync now if needed
+            wifi_up = up
+            if up:
+                if not synced:
+                    if now - last_retry > RETRY_EVERY_S:
+                        last_retry = now
+                        synced = ntp_set_rtc()
+                        last_sync = time.time()
+                elif now - last_sync > RESYNC_EVERY_S:
+                    if ntp_set_rtc():
+                        last_sync = time.time()
+                refresh_weather()
 
-    if mono_ms() - last_net >= 1000 and mono_ms() - last_input >= NET_QUIET_MS:
-        last_net = mono_ms()
-        now = time.time()
-        up = wifi_tick()
-        if up and not wifi_up:
-            last_retry = 0          # link just came back: sync now if needed
-        wifi_up = up
-        if up:
-            if not synced:
-                if now - last_retry > RETRY_EVERY_S:
-                    last_retry = now
-                    synced = ntp_set_rtc()
-                    last_sync = time.time()
-            elif now - last_sync > RESYNC_EVERY_S:
-                if ntp_set_rtc():
-                    last_sync = time.time()
-            refresh_weather()
+        time.sleep_ms(POLL_MS)
 
-    time.sleep_ms(POLL_MS)
+except Exception as e:
+    log_crash(e)
+    rgb_led.set_rgb(0, 0, 0)
+    time.sleep(5)
+    machine.reset()

@@ -2,18 +2,23 @@
 
 Runs the real main.py under CPython with fake machine/network/picographics/
 utime modules, then walks the four screens, the focus timer (start, pause,
-finish, reset), the idle return to the clock, NTP sync from a 2021 RTC and
-UK BST edges. The tick counter starts one minute before its 2**30 wrap so
+finish, reset, LED glow), the idle return to the clock, night dimming, NTP
+sync from a 2021 RTC with bad replies rejected, the crash guard and UK BST
+edges. The tick counter starts one minute before its 2**30 wrap so
 every ticks_diff path crosses the wrap. Plain asserts, no pytest.
 
 Usage: python3 tests/host_sim.py
 """
+import builtins
 import calendar
+import io
 import json
 import os
+import re
 import struct as cstruct
 import sys
 import time as ctime
+import traceback
 import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -28,6 +33,34 @@ TRUE_START = calendar.timegm((2026, 11, 10, 12, 34, 50, 0, 0, 0))
 
 class StopSim(BaseException):
     """BaseException so main.py's own `except Exception` blocks cannot eat it."""
+
+
+class BoardReset(BaseException):
+    """machine.reset(): the board restarts, so the run ends here."""
+
+
+# MicroPython's sys.print_exception, used by the crash guard.
+sys.print_exception = lambda e, f=sys.stdout: traceback.print_exception(
+    type(e), e, e.__traceback__, file=f)
+
+# Files main.py writes (the crash log) are kept in memory.
+written = {}
+
+
+class MemFile(io.StringIO):
+    def __init__(self, path):
+        super().__init__()
+        self.path = path
+
+    def close(self):
+        written[self.path] = self.getvalue()
+        super().close()
+
+
+def fake_open(path, mode='r', *args, **kwargs):
+    if 'w' in mode:
+        return MemFile(path)
+    return builtins.open(path, mode, *args, **kwargs)
 
 
 # ---------------- fake time ----------------
@@ -106,6 +139,13 @@ machine.RTC = RTC
 machine.disable_irq = lambda: 0
 machine.enable_irq = lambda state: None
 
+
+def board_reset():
+    raise BoardReset
+
+
+machine.reset = board_reset
+
 # ---------------- fake network / NTP ----------------
 net_state = {'connected': False}
 
@@ -150,12 +190,20 @@ class Sock:
         net_state['ntp'] = net_state.get('ntp', 0) + 1
 
     def recv(self, n):
-        pkt = bytearray(48)
-        pkt[40:44] = cstruct.pack('!I', clock.true_now() + 2208988800)
-        return bytes(pkt)
+        if 'ntp_reply' in net_state:
+            return net_state['ntp_reply']
+        return ntp_packet(clock.true_now())
 
     def close(self):
         pass
+
+
+def ntp_packet(unix_secs, head=0x24, stratum=2):
+    """A server reply: LI 0, version 4, mode 4 (0x24), stratum 2."""
+    pkt = bytearray(48)
+    pkt[0], pkt[1] = head, stratum
+    pkt[40:44] = cstruct.pack('!I', unix_secs + 2208988800)
+    return bytes(pkt)
 
 
 usocket = types.ModuleType('usocket')
@@ -201,6 +249,8 @@ urequests.get = fake_get
 
 # ---------------- fake display ----------------
 frames = []
+backlights = []
+display_fault = {}
 
 
 class PicoGraphics:
@@ -215,7 +265,7 @@ class PicoGraphics:
         return self.w, self.h
 
     def set_backlight(self, v):
-        pass
+        backlights.append(v)
 
     def set_font(self, f):
         assert f == 'bitmap8', 'this firmware has bitmap fonts only'
@@ -245,6 +295,8 @@ class PicoGraphics:
         assert x >= 0 and y >= 0 and x + w <= self.w and y + h <= self.h, (x, y, w, h)
 
     def update(self):
+        if 'update' in display_fault:
+            raise RuntimeError(display_fault.pop('update'))
         frames.append({'bg': self.bg, 'ops': list(self.ops), 't': clock.elapsed_ms})
 
 
@@ -321,6 +373,7 @@ def scenario():
     # Boot: NTP corrects the 2021 RTC, clock shows 12:34 GMT, LED forced off.
     run_for(2000)
     assert led_rgb == [(0, 0, 0)], led_rgb
+    assert backlights == [0.55], ('daytime boot must not dim', backlights)
     assert net_state.get('ssid') == 'GCMembers'
     assert texts() == ['12', '34'], texts()
     assert [op[1] for op in frames[-1]['ops']] == ['white', 'teal']
@@ -344,10 +397,21 @@ def scenario():
     assert len(texts()) == 2 and texts()[0].isdigit(), texts()
     checks.append('quick B tap between polls still opens the date')
 
+    # A, B and Y switch the moment they go down, not on release.
+    button_down[B] = True
+    edge(B)
+    run_for(40)
+    assert texts() == ['TUESDAY', '10', 'NOV'], ('B acts on press-down', texts())
+    button_down[B] = False
+    run_for(60)
+    press(A)
+    checks.append('A/B/Y switch screens on press-down')
+
     # Y: weather from the real Open-Meteo sample.
     press(Y)
+    # Rain 3h: the highest of the hourly slots 15:00-18:00 (12, 28, 49, 67).
     assert texts() == ['10\u00b0C', 'Cloudy', 'High', '10\u00b0C', 'Low', '6\u00b0C',
-                       'Rain', '100%'], texts()
+                       'Rain 3h', '67%'], texts()
     assert [op[1] for op in frames[-1]['ops']] == ['white', 'teal', 'teal', 'white',
                                                    'teal', 'white', 'teal', 'white']
     press(Y)   # second press asks for a refresh, made once buttons are quiet
@@ -394,6 +458,25 @@ def scenario():
     assert texts()[3:] == before, (before, texts())
     checks.append('press bounce sampled mid-gap toggles the timer once')
 
+    # The first poll after a release catching the pin low again (release
+    # bounce) must not start a second press: X would toggle twice.
+    run_for(500)
+    before = texts()[3:]
+    button_down[X] = True
+    edge(X)
+    run_for(150)
+    button_down[X] = False
+    yield_point()                  # one loop pass: the release, one toggle
+    button_down[X] = True          # release bounce, caught low by the poll
+    edge(X)
+    yield_point()
+    button_down[X] = False
+    run_for(300)
+    assert texts()[3:] != before, ('release bounce toggled the timer twice', before, texts())
+    press(X)                       # back to the previous state
+    assert texts()[3:] == before, (before, texts())
+    checks.append('release bounce caught low does not press again')
+
     # Pause holds the value; idle return still applies when paused.
     press(X)
     paused = texts()[:4]
@@ -409,12 +492,23 @@ def scenario():
     assert texts() == ['FOCUS', '25', '00', 'READY'], texts()
     checks.append('hold X resets')
 
+    # A long X press from another screen only shows the timer: it must not
+    # wipe a running session you cannot see.
+    press(X)                       # start
+    press(A)
+    press(X, hold_ms=1300)
+    assert texts()[0] == 'FOCUS' and len(texts()) == 3, ('hold off-screen reset', texts())
+    press(X, hold_ms=1300)         # on the timer screen: resets
+    assert texts() == ['FOCUS', '25', '00', 'READY'], texts()
+    checks.append('hold X resets only on the timer screen')
+
     # Run a full 25 minutes from the clock screen: auto-switch and flash.
     press(X)            # start
     press(A)            # go to clock while it runs
     assert len(texts()) == 2
     run_for(25 * 60 * 1000 + 3000)
     assert texts()[0] == 'FOCUS', 'finish switches to timer'
+    assert led_rgb[-1] == (0, 90, 80), ('LED glows when the session ends', led_rgb[-3:])
     flash_bgs = {f['bg'] for f in frames if f['ops'] and f['ops'][0][0] == 'FOCUS'
                  and clock.elapsed_ms - f['t'] < 4000}
     assert 'teal' in flash_bgs and 'black' in flash_bgs, flash_bgs
@@ -423,10 +517,12 @@ def scenario():
     assert frames[-1]['bg'] == 'black'
     run_for(20000)
     assert len(texts()) == 2, 'done screen returns to clock'
-    checks.append('25 min finish: auto-switch, teal flash, DONE, return')
+    assert led_rgb[-1] == (0, 90, 80), 'glow outlasts the screen'
+    checks.append('25 min finish: auto-switch, teal flash, DONE, return, LED glow')
 
-    # X on DONE resets.
+    # X on DONE resets; the first press already ends the glow.
     press(X)
+    assert led_rgb[-1] == (0, 0, 0), ('a press ends the glow', led_rgb[-3:])
     press(X)
     assert texts() == ['FOCUS', '25', '00', 'READY'], texts()
     checks.append('X on DONE resets')
@@ -527,9 +623,43 @@ def scenario():
     idle_days(7)
     press(Y)
     assert texts()[:2] == ['--\u00b0C', 'No data'], ('week-old reading shown', texts())
+    press(A)
     weather_http['ok'] = True
     checks.append('8 untouched days: fetches and NTP continue, tap seen, old data ages out')
-    raise StopSim
+
+    # Night: 22:00-07:00 UK time dims the backlight; a session that ends at
+    # night glows dimmer, and the glow ends by itself after 30 minutes.
+    def jump_to_hour(h):
+        secs = clock.rtc_now()           # UTC, and UK is on GMT in November
+        clock.elapsed_ms += ((h * 3600 - secs % 86400) % 86400) * 1000
+        run_for(100)
+
+    jump_to_hour(21)
+    assert backlights[-1] == 0.55, backlights[-3:]
+    jump_to_hour(22)
+    assert backlights[-1] == 0.15, ('22:00 dims', backlights[-3:])
+    press(X)
+    if texts()[3:] == ['DONE']:
+        press(X)
+    assert texts() == ['FOCUS', '25', '00', 'READY'], texts()
+    press(X)                             # start at night
+    clock.elapsed_ms += 25 * 60 * 1000
+    run_for(200)
+    assert texts()[0] == 'FOCUS' and led_rgb[-1] == (0, 20, 18), ('night glow', led_rgb[-3:])
+    clock.elapsed_ms += 31 * 60 * 1000
+    run_for(100)
+    assert led_rgb[-1] == (0, 0, 0), ('glow must end after 30 min', led_rgb[-3:])
+    jump_to_hour(7)
+    assert backlights[-1] == 0.55, ('07:00 back to full', backlights[-3:])
+    checks.append('night dims 22:00-07:00, night glow dimmer, glow ends after 30 min')
+
+    # Crash guard: an unexpected error is logged and the board restarts
+    # instead of freezing on its last frame.
+    display_fault['update'] = 'simulated display fault'
+    checks.append('crash guard armed')
+    press(B)
+    run_for(10000)
+    raise AssertionError('an unexpected error did not restart the board')
 
 
 def main():
@@ -568,14 +698,38 @@ def main():
     t.start()
     clock.hook = hook
     src = open(MAIN).read()
-    g = {'__name__': '__main__'}
+    g = {'__name__': '__main__', 'open': fake_open}
     try:
         exec(compile(src, 'main.py', 'exec'), g)
     except StopSim:
         pass
+    except BoardReset:
+        result['reset'] = True
+    clock.hook = None
     if 'error' in result:
         raise result['error']
-    assert result.get('ok'), result
+    assert result.get('reset') and checks[-1] == 'crash guard armed', (result, checks[-1:])
+    log = written.get('crash.txt', '')
+    assert re.match(r'\d\d/\d\d/\d{4} \d\d:\d\d:\d\d UK, uptime \d+ s\n', log), log
+    assert 'simulated display fault' in log, log
+    assert led_rgb[-1] == (0, 0, 0)
+    checks[-1] = 'crash guard: error written to crash.txt, LED off, board restarts'
+
+    # NTP replies that are not a usable time leave the RTC alone.
+    ntp = g['ntp_set_rtc']
+    good = clock.rtc_base
+    now = clock.true_now()
+    for label, reply in (('short', ntp_packet(now)[:20]),
+                         ('kiss-of-death', ntp_packet(0 - 2208988800, stratum=0)),
+                         ('zero timestamp', ntp_packet(0 - 2208988800)),
+                         ('unsynchronised', ntp_packet(now, head=0xE4)),
+                         ('client mode', ntp_packet(now, head=0x23)),
+                         ('year 2021', ntp_packet(calendar.timegm((2021, 1, 1, 0, 0, 0))))):
+        net_state['ntp_reply'] = reply
+        assert ntp() is False and clock.rtc_base == good, ('bad NTP reply used', label)
+    del net_state['ntp_reply']
+    assert ntp() is True
+    checks.append('NTP: short, kiss-of-death, unsynchronised and implausible replies rejected')
 
     # Pure-function checks on the loaded module.
     def ts(*a):
@@ -596,10 +750,10 @@ def main():
     # Weather layout edge cases: no data, and a cold night with long values.
     disp = g['display']
     for data, want in ((None, ['--\u00b0C', 'No data', 'High', '--\u00b0C', 'Low', '--\u00b0C',
-                               'Rain', '--']),
+                               'Rain 3h', '--']),
                        ((-12, 85, -10, -15, 100, 0), ['-12\u00b0C', 'Snow showers', 'High',
                                                     '-10\u00b0C', 'Low', '-15\u00b0C',
-                                                    'Rain', '100%'])):
+                                                    'Rain 3h', '100%'])):
         disp.set_pen('black')
         disp.clear()
         g['draw_weather'](data)
@@ -611,7 +765,7 @@ def main():
         assert disp.ops[1][2] >= 2, ('caption must never fall to size 1', disp.ops[1])
         rows = disp.ops[2:]
         scales = {op[2] for op in rows}
-        assert len(scales) == 1, 'rows share one scale'
+        assert scales == {2}, ('rows share one readable scale', scales)
         for label, value in zip(rows[0::2], rows[1::2]):
             assert label[4] == value[4], 'label and value on one baseline'
             assert label[3] + disp.measure_text(label[0], label[2]) < value[3], (label, value)
