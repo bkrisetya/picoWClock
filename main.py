@@ -39,12 +39,14 @@ GLOW_MAX_MS = 30 * 60 * 1000
 CRASH_LOG = 'crash.txt'
 NTP_HOST = 'pool.ntp.org'
 RETRY_EVERY_S = 60
-# Network calls block the loop (a weather fetch takes 1-6 s), so they run
+# Network calls block the loop (a weather fetch takes 1-13 s), so they run
 # only once the buttons have been left alone this long.
 NET_QUIET_MS = 3000
 WIFI_ATTEMPT_MS = 15 * 1000     # background join attempt, then next network
 WIFI_FAIL_WAIT_MS = 5 * 1000    # minimum spacing when a join fails outright
-WEATHER_TIMEOUT_S = 6
+# On a weak link (CSEFB at -87 dBm) the TLS handshake alone took 6-12.5 s,
+# so a shorter limit failed most fetches and the failures dropped the link.
+WEATHER_TIMEOUT_S = 15
 RESYNC_EVERY_S = 6 * 3600
 MIN_PLAUSIBLE_YEAR = 2024
 
@@ -157,13 +159,18 @@ def connect_wifi(timeout_s=15, show=False):
         draw_centred('WiFi', (height - 32) // 2, 4, white)
         display.update()
     wlan.active(True)
-    nets = known_networks()
-    try:
-        visible = [s[0].decode('utf-8', 'replace') for s in wlan.scan()]
-        nets = [n for n in nets if n[0] in visible]
-    except OSError:
-        pass  # scan failed: try every known network
     known = known_networks()
+    # Networks the scan can see go first, strongest first. The rest are
+    # still tried afterwards: a hidden network (CSEFB at UCL CS) never
+    # shows its name in a scan, yet joins when asked for by name.
+    signal = {}
+    try:
+        for s in wlan.scan():
+            name = s[0].decode('utf-8', 'replace')
+            signal[name] = max(signal.get(name, -999), s[3])
+    except OSError:
+        pass  # scan failed: try every known network in order
+    nets = sorted(known, key=lambda n: -signal.get(n[0], -999))
     for ssid, psk in nets:
         wifi['idx'] = known.index((ssid, psk))
         wlan.connect(ssid, psk)
@@ -789,7 +796,10 @@ try:
                 elif now - last_sync > RESYNC_EVERY_S:
                     if ntp_set_rtc():
                         last_sync = time.time()
-                refresh_weather()
+                # A slow fetch freezes the loop; never do that to a
+                # countdown on screen. It runs once the session ends.
+                if not (screen == 'timer' and focus.state == 'running'):
+                    refresh_weather()
 
         time.sleep_ms(POLL_MS)
 

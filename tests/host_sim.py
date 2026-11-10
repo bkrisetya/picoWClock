@@ -161,10 +161,12 @@ class WLAN:
         return True
 
     def scan(self):
-        return [(b'GCMembers', b'', 1, -50, 3, False), (b'Other', b'', 6, -70, 3, False)]
+        return net_state.get('scan', [(b'GCMembers', b'', 1, -50, 3, False),
+                                      (b'Other', b'', 6, -70, 3, False)])
 
     def connect(self, ssid, psk):
-        net_state['connected'] = ssid == 'GCMembers' and not net_state.get('down')
+        net_state['connected'] = (ssid == net_state.get('joinable', 'GCMembers')
+                                  and not net_state.get('down'))
         net_state['ssid'] = ssid
         net_state['connects'] = net_state.get('connects', 0) + 1
         net_state.setdefault('tried', []).append(ssid)
@@ -231,7 +233,7 @@ class Resp:
 
 def fake_get(url, timeout=None):
     weather_http['calls'] += 1
-    assert timeout == 6, 'weather fetch must pass a short timeout'
+    assert timeout is not None and timeout <= 20, 'weather fetch must pass a bounded timeout'
     # Presses made while the fetch blocks the loop: only the edge IRQ sees them.
     for pin in weather_http.pop('presses_during', ()):
         button_down[pin] = True
@@ -241,6 +243,10 @@ def fake_get(url, timeout=None):
         clock.elapsed_ms += 200
     if not weather_http['ok']:
         raise OSError('simulated network failure')
+    latency = weather_http.get('latency_s', 0)
+    clock.elapsed_ms += int(min(latency, timeout) * 1000)
+    if latency > timeout:
+        raise OSError(110, 'ETIMEDOUT')
     return Resp()
 
 
@@ -355,6 +361,10 @@ def tap(pin):
     run_for(60)
 
 
+def focus_state():
+    return MAIN_G['g']['focus'].state
+
+
 def run_for(ms):
     target = clock.elapsed_ms + ms
     while clock.elapsed_ms < target:
@@ -363,6 +373,9 @@ def run_for(ms):
 
 def yield_point():
     raise RuntimeError('replaced at runtime')
+
+
+MAIN_G = {}     # main.py's globals, filled in by main()
 
 
 A, B, X, Y = 12, 13, 14, 15
@@ -653,6 +666,41 @@ def scenario():
     assert backlights[-1] == 0.55, ('07:00 back to full', backlights[-3:])
     checks.append('night dims 22:00-07:00, night glow dimmer, glow ends after 30 min')
 
+    # Weak campus link: on CSEFB at -87 dBm the TLS handshake alone took
+    # 6-12.5 s (measured 10/11/2026). A 12 s fetch must still succeed.
+    g = MAIN_G['g']
+    weather_http['latency_s'] = 12
+    press(Y)
+    press(Y)
+    calls = weather_http['calls']
+    run_for(3500)
+    assert weather_http['calls'] == calls + 1, weather_http
+    w = g['weather']
+    assert w['fails'] == 0 and w['due'] - g['mono_ms']() > 10 * 60 * 1000, ('slow fetch failed', w)
+    checks.append('weak link: a 12 s weather fetch succeeds')
+
+    # That fetch freezes the loop, so it waits while a focus session counts
+    # down on screen, and runs as soon as the countdown stops.
+    press(X)
+    if texts()[3:] == ['DONE']:
+        press(X)
+    press(X)
+    assert focus_state() == 'running', focus_state()
+    w['due'] = 0
+    calls = weather_http['calls']
+    shown = len(frames)
+    run_for(60 * 1000)
+    assert weather_http['calls'] == calls, 'fetch froze a running countdown'
+    gaps = [b['t'] - a['t'] for a, b in zip(frames[shown:], frames[shown + 1:])]
+    assert gaps and max(gaps) <= 1100, ('countdown froze', max(gaps or [0]))
+    press(X)                                  # pause
+    run_for(3500)
+    assert weather_http['calls'] == calls + 1, weather_http
+    press(X, hold_ms=1200)                    # reset
+    assert texts()[3:] == ['READY'], texts()
+    weather_http['latency_s'] = 0
+    checks.append('no weather fetch while a focus countdown is on screen')
+
     # Crash guard: an unexpected error is logged and the board restarts
     # instead of freezing on its last frame.
     display_fault['update'] = 'simulated display fault'
@@ -699,6 +747,7 @@ def main():
     clock.hook = hook
     src = open(MAIN).read()
     g = {'__name__': '__main__', 'open': fake_open}
+    MAIN_G.update(g=g)
     try:
         exec(compile(src, 'main.py', 'exec'), g)
     except StopSim:
@@ -730,6 +779,21 @@ def main():
     del net_state['ntp_reply']
     assert ntp() is True
     checks.append('NTP: short, kiss-of-death, unsynchronised and implausible replies rejected')
+
+    # Boot join. CSEFB at UCL CS is hidden: a scan shows the UCL networks
+    # and nameless entries, never 'CSEFB', yet it joins when asked by name.
+    join = g['connect_wifi']
+    net_state.update(connected=False, tried=[], joinable='CSEFB',
+                     scan=[(b'eduroam', b'', 1, -65, 5, False), (b'', b'', 1, -66, 5, True),
+                           (b'CSGUEST', b'', 11, -86, 0, False)])
+    assert join() is True and net_state['ssid'] == 'CSEFB', ('hidden network skipped', net_state)
+    # Networks the scan can see come first, strongest first.
+    net_state.update(connected=False, tried=[], joinable='CSEFB',
+                     scan=[(b'GCMembers', b'', 6, -88, 3, False), (b'CSEFB', b'', 11, -60, 3, False)])
+    assert join() is True and net_state['tried'] == ['CSEFB'], net_state['tried']
+    for k in ('scan', 'joinable'):
+        del net_state[k]
+    checks.append('boot join: hidden CSEFB tried after visible networks, strongest first')
 
     # Pure-function checks on the loaded module.
     def ts(*a):
