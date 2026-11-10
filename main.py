@@ -29,7 +29,7 @@ MIN_PLAUSIBLE_YEAR = 2024
 # ---------------- display ----------------
 from picographics import PicoGraphics, DISPLAY_PICO_DISPLAY
 
-display = PicoGraphics(display=DISPLAY_PICO_DISPLAY, rotate=0)
+display = PicoGraphics(display=DISPLAY_PICO_DISPLAY, rotate=90)
 width, height = display.get_bounds()
 display.set_backlight(BRIGHTNESS)
 display.set_font('bitmap8')
@@ -141,15 +141,20 @@ def draw_clock():
     tm = uk_time()
     year, month, day, hour, minute, second, weekday, _ = tm
     if year < MIN_PLAUSIBLE_YEAR:
-        display.set_pen(black)
-        display.clear()
-        draw_centred('--:--', (height - 64) // 2, 8, white)
+        hh = mm = '--'
     else:
-        hhmm = '{:02d}:{:02d}'.format(hour, minute)
-        scale = fit_scale(hhmm, 232, 8)
-        display.set_pen(black)
-        display.clear()
-        draw_centred(hhmm, (height - 8 * scale) // 2, scale, white)
+        hh = '{:02d}'.format(hour)
+        mm = '{:02d}'.format(minute)
+    half_h = height // 2
+    scale = min(fit_scale(hh, width - 8, 15),
+                fit_scale(mm, width - 8, 15),
+                (half_h - 8) // 8)
+    top_y = max(0, (half_h - 8 * scale) // 2)
+    bot_y = half_h + max(0, (half_h - 8 * scale) // 2)
+    display.set_pen(black)
+    display.clear()
+    draw_centred(hh, top_y, scale, white)
+    draw_centred(mm, bot_y, scale, white)
     display.update()
 
 
