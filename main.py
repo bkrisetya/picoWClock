@@ -29,13 +29,14 @@ MIN_PLAUSIBLE_YEAR = 2024
 # ---------------- display ----------------
 from picographics import PicoGraphics, DISPLAY_PICO_DISPLAY
 
-display = PicoGraphics(display=DISPLAY_PICO_DISPLAY, rotate=90)
+display = PicoGraphics(display=DISPLAY_PICO_DISPLAY, rotate=270)
 width, height = display.get_bounds()
 display.set_backlight(BRIGHTNESS)
 display.set_font('bitmap8')
 
 black = display.create_pen(0, 0, 0)
 white = display.create_pen(255, 255, 255)
+orange = display.create_pen(255, 128, 0)
 
 led_onboard = machine.Pin('LED', machine.Pin.OUT, value=0)
 
@@ -154,7 +155,7 @@ def draw_clock():
     display.set_pen(black)
     display.clear()
     draw_centred(hh, top_y, scale, white)
-    draw_centred(mm, bot_y, scale, white)
+    draw_centred(mm, bot_y, scale, orange)
     display.update()
 
 
