@@ -1,8 +1,12 @@
-# picoWClock - bare clock for Raspberry Pi Pico 2 W + Pimoroni Display Pack
-# 1.14" (PIM543, 240x135). Fork of chriskalv/picoWClock (Display Pack 2.0),
-# stripped to the clock itself and adapted for the small panel: no
-# temperature, no language switching, no birthday wish, no buttons.
-# UK time (GMT / BST) instead of CET. WiFi credentials live in
+# picoWClock - desk clock for Raspberry Pi Pico 2 W + Pimoroni Display Pack
+# 1.14" (PIM543, 240x135), portrait. Fork of chriskalv/picoWClock (Display
+# Pack 2.0), rebuilt for the small panel with one screen per button:
+#   A  clock (default): hours white on top, minutes orange below
+#   B  date: weekday, day number, month
+#   X  focus timer, 25 minutes: X again starts or pauses, hold X to reset
+#   Y  London weather from Open-Meteo (no key): Y again refreshes
+# Other screens fall back to the clock after 20 s without a press, except
+# while the timer runs. UK time (GMT / BST). WiFi networks live in
 # WIFI_CONFIG.py (git-ignored; the owner fills it in).
 #
 # If WiFi or NTP is unreachable the clock keeps running from the RTC and
@@ -11,7 +15,6 @@
 import gc
 import machine
 import network
-import sys
 import utime as time
 import usocket as socket
 import ustruct as struct
@@ -25,6 +28,27 @@ NTP_HOST = 'pool.ntp.org'
 RETRY_EVERY_S = 60
 RESYNC_EVERY_S = 6 * 3600
 MIN_PLAUSIBLE_YEAR = 2024
+
+POLL_MS = 30
+HOLD_MS = 1000
+IDLE_RETURN_MS = 20 * 1000
+FOCUS_MS = 25 * 60 * 1000
+DONE_FLASH_MS = 6 * 1000
+
+WEATHER_URL = ('https://api.open-meteo.com/v1/forecast'
+               '?latitude=51.5246&longitude=-0.1340'
+               '&current=temperature_2m,weather_code'
+               '&daily=temperature_2m_max,temperature_2m_min,'
+               'precipitation_probability_max'
+               '&timezone=Europe%2FLondon&forecast_days=1')
+WEATHER_EVERY_MS = 15 * 60 * 1000
+WEATHER_RETRY_MS = 2 * 60 * 1000
+WEATHER_MAX_AGE_MS = 3 * 3600 * 1000
+
+DAYS = ('MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY',
+        'FRIDAY', 'SATURDAY', 'SUNDAY')
+MONTHS = (None, 'JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN',
+          'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC')
 
 # ---------------- display ----------------
 from picographics import PicoGraphics, DISPLAY_PICO_DISPLAY
@@ -70,7 +94,7 @@ def connect_wifi(timeout_s=15, show=False):
     """Join whichever known network is in range. Returns True on success.
 
     show=True paints a status screen (boot only); background retries stay
-    silent so the clock face is never blanked.
+    silent so the face on screen is never blanked.
     """
     try:
         import rp2
@@ -152,6 +176,142 @@ def uk_time():
     return time.localtime(now)
 
 
+# ---------------- buttons ----------------
+BUTTONS = [(name, machine.Pin(pin, machine.Pin.IN, machine.Pin.PULL_UP))
+           for name, pin in (('A', 12), ('B', 13), ('X', 14), ('Y', 15))]
+pressed_at = {}
+hold_fired = {}
+
+
+def poll_buttons():
+    """Return (name, 'press' | 'hold') events. A press fires on release,
+    a hold fires once after HOLD_MS while still down."""
+    events = []
+    now = time.ticks_ms()
+    for name, pin in BUTTONS:
+        if pin.value() == 0:
+            if name not in pressed_at:
+                pressed_at[name] = now
+                hold_fired[name] = False
+            elif not hold_fired[name] and time.ticks_diff(now, pressed_at[name]) >= HOLD_MS:
+                hold_fired[name] = True
+                events.append((name, 'hold'))
+        elif name in pressed_at:
+            held = time.ticks_diff(now, pressed_at.pop(name))
+            if not hold_fired.pop(name) and held >= 20:
+                events.append((name, 'press'))
+    return events
+
+
+# ---------------- focus timer ----------------
+class FocusTimer:
+    """25-minute countdown on the monotonic tick clock, so an NTP step of
+    the RTC never disturbs it."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.state = 'ready'   # ready | running | paused | done
+        self.left = FOCUS_MS
+        self.end = 0
+        self.done_at = 0
+
+    def remaining(self):
+        if self.state == 'running':
+            return max(0, time.ticks_diff(self.end, time.ticks_ms()))
+        return self.left
+
+    def toggle(self):
+        if self.state in ('ready', 'paused'):
+            self.end = time.ticks_add(time.ticks_ms(), self.left)
+            self.state = 'running'
+        elif self.state == 'running':
+            self.left = self.remaining()
+            self.state = 'paused'
+        else:
+            self.reset()
+
+    def update(self):
+        """True exactly once, when a running countdown reaches zero."""
+        if self.state == 'running' and self.remaining() == 0:
+            self.state = 'done'
+            self.left = 0
+            self.done_at = time.ticks_ms()
+            return True
+        return False
+
+    def flashing(self):
+        return (self.state == 'done'
+                and time.ticks_diff(time.ticks_ms(), self.done_at) < DONE_FLASH_MS)
+
+
+focus = FocusTimer()
+
+
+# ---------------- weather ----------------
+CONDITIONS = ((0, 'CLEAR'), (1, 'FAIR'), (2, 'PART CLOUD'), (3, 'CLOUDY'),
+              (48, 'FOG'), (57, 'DRIZZLE'), (67, 'RAIN'), (77, 'SNOW'),
+              (82, 'SHOWERS'), (86, 'SNOW'), (99, 'STORM'))
+
+weather = {'data': None, 'at': 0, 'due': time.ticks_ms()}
+
+
+def condition_name(code):
+    """WMO weather code to a short word (first band whose ceiling fits)."""
+    for ceiling, name in CONDITIONS:
+        if code <= ceiling:
+            return name
+    return 'WEATHER'
+
+
+def fetch_weather():
+    """(temp, code, high, low, rain_pct) for London, or None on any failure."""
+    try:
+        import urequests
+        gc.collect()
+        r = urequests.get(WEATHER_URL, timeout=10)
+        try:
+            if r.status_code != 200:
+                return None
+            d = r.json()
+        finally:
+            r.close()
+        cur = d['current']
+        day = d['daily']
+        rain = day['precipitation_probability_max'][0]
+        return (round(cur['temperature_2m']), int(cur['weather_code']),
+                round(day['temperature_2m_max'][0]),
+                round(day['temperature_2m_min'][0]),
+                None if rain is None else int(rain))
+    except Exception:
+        return None
+
+
+def refresh_weather(force=False):
+    now = time.ticks_ms()
+    if not force and time.ticks_diff(now, weather['due']) < 0:
+        return
+    if not wifi_connected():
+        return
+    data = fetch_weather()
+    now = time.ticks_ms()
+    if data:
+        weather['data'] = data
+        weather['at'] = now
+        weather['due'] = time.ticks_add(now, WEATHER_EVERY_MS)
+    else:
+        weather['due'] = time.ticks_add(now, WEATHER_RETRY_MS)
+
+
+def current_weather():
+    if weather['data'] is None:
+        return None
+    if time.ticks_diff(time.ticks_ms(), weather['at']) > WEATHER_MAX_AGE_MS:
+        return None
+    return weather['data']
+
+
 # ---------------- drawing ----------------
 def fit_scale(text, max_w, start):
     """Largest integer bitmap scale whose rendered width fits max_w."""
@@ -167,24 +327,104 @@ def draw_centred(text, y, scale, pen):
     display.text(text, x, y, width, scale)
 
 
-def draw_clock():
-    tm = uk_time()
-    year, month, day, hour, minute, second, weekday, _ = tm
-    if year < MIN_PLAUSIBLE_YEAR:
-        hh = mm = '--'
+def band_scale(text, y0, y1, max_scale):
+    """Largest scale that fits text across the panel and inside band y0..y1."""
+    return max(1, min(fit_scale(text, width - 8, max_scale), (y1 - y0 - 4) // 8))
+
+
+def draw_band(text, y0, y1, pen, scale):
+    """Draw text centred horizontally and vertically inside band y0..y1."""
+    draw_centred(text, y0 + max(0, (y1 - y0 - 8 * scale) // 2), scale, pen)
+
+
+def draw_pair(top, bottom, y0, y1, top_pen, bottom_pen):
+    """Two equal-size rows splitting y0..y1 (clock and timer digits)."""
+    mid = (y0 + y1) // 2
+    scale = min(band_scale(top, y0, mid, 15), band_scale(bottom, mid, y1, 15))
+    draw_band(top, y0, mid, top_pen, scale)
+    draw_band(bottom, mid, y1, bottom_pen, scale)
+
+
+def draw_clock(tm, synced_time):
+    if synced_time:
+        hh = '{:02d}'.format(tm[3])
+        mm = '{:02d}'.format(tm[4])
     else:
-        hh = '{:02d}'.format(hour)
-        mm = '{:02d}'.format(minute)
-    half_h = height // 2
-    scale = min(fit_scale(hh, width - 8, 15),
-                fit_scale(mm, width - 8, 15),
-                (half_h - 8) // 8)
-    top_y = max(0, (half_h - 8 * scale) // 2)
-    bot_y = half_h + max(0, (half_h - 8 * scale) // 2)
-    display.set_pen(black)
+        hh = mm = '--'
+    draw_pair(hh, mm, 0, height, white, orange)
+
+
+def draw_date(tm, synced_time):
+    if synced_time:
+        day_name, day_num, month = DAYS[tm[6]], str(tm[2]), MONTHS[tm[1]]
+    else:
+        day_name, day_num, month = '--', '--', '--'
+    draw_band(day_name, 0, 60, orange, band_scale(day_name, 0, 60, 4))
+    draw_band(day_num, 60, 176, white, band_scale(day_num, 60, 176, 15))
+    draw_band(month, 176, height, orange, band_scale(month, 176, height, 8))
+
+
+def draw_timer(secs, fg, accent):
+    label = {'ready': 'READY', 'paused': 'PAUSED', 'done': 'DONE'}.get(focus.state, '')
+    draw_band('FOCUS', 0, 32, accent, band_scale('FOCUS', 0, 32, 3))
+    draw_pair('{:02d}'.format(secs // 60), '{:02d}'.format(secs % 60),
+              32, 212, fg, accent)
+    if label:
+        draw_band(label, 212, height, fg, band_scale(label, 212, height, 3))
+
+
+def draw_weather(data):
+    if data is None:
+        rows = ('WEATHER', '--', 'NO DATA', '')
+    else:
+        temp, code, high, low, rain = data
+        rows = (condition_name(code), '{}C'.format(temp),
+                'H{} L{}'.format(high, low),
+                'RAIN {}%'.format('--' if rain is None else rain))
+    draw_band(rows[0], 0, 44, orange, band_scale(rows[0], 0, 44, 3))
+    draw_band(rows[1], 44, 150, white, band_scale(rows[1], 44, 150, 12))
+    draw_band(rows[2], 150, 196, white, band_scale(rows[2], 150, 196, 4))
+    if rows[3]:
+        draw_band(rows[3], 196, height, orange, band_scale(rows[3], 196, height, 4))
+
+
+last_frame = None
+
+
+def render(screen):
+    """Redraw only when what the screen shows has changed."""
+    global last_frame
+    tm = uk_time()
+    synced_time = tm[0] >= MIN_PLAUSIBLE_YEAR
+    secs = (focus.remaining() + 999) // 1000
+    flash_on = focus.flashing() and (time.ticks_ms() // 500) % 2 == 0
+    wx = current_weather()
+    if screen == 'clock':
+        frame = ('clock', synced_time, tm[3], tm[4])
+    elif screen == 'date':
+        frame = ('date', synced_time, tm[0], tm[1], tm[2])
+    elif screen == 'timer':
+        frame = ('timer', focus.state, secs, flash_on)
+    else:
+        frame = ('weather', wx)
+    if frame == last_frame:
+        return
+    last_frame = frame
+
+    timer_flash = screen == 'timer' and flash_on
+    display.set_pen(orange if timer_flash else black)
     display.clear()
-    draw_centred(hh, top_y, scale, white)
-    draw_centred(mm, bot_y, scale, orange)
+    if screen == 'clock':
+        draw_clock(tm, synced_time)
+    elif screen == 'date':
+        draw_date(tm, synced_time)
+    elif screen == 'timer':
+        if timer_flash:
+            draw_timer(secs, black, black)
+        else:
+            draw_timer(secs, white, orange)
+    else:
+        draw_weather(wx)
     display.update()
 
 
@@ -196,24 +436,56 @@ if wifi_ok:
 
 last_retry = time.time()
 last_sync = time.time()
+last_net = time.ticks_ms()
+last_input = time.ticks_ms()
+screen = 'clock'
 
 while True:
-    draw_clock()
+    for name, kind in poll_buttons():
+        last_input = time.ticks_ms()
+        if name == 'A':
+            screen = 'clock'
+        elif name == 'B':
+            screen = 'date'
+        elif name == 'X':
+            if kind == 'hold':
+                focus.reset()
+            elif screen == 'timer':
+                focus.toggle()
+            screen = 'timer'
+        elif name == 'Y':
+            if screen == 'weather' and kind == 'press':
+                refresh_weather(force=True)
+            screen = 'weather'
 
-    now = time.time()
-    if not wifi_connected():
-        if now - last_retry > RETRY_EVERY_S:
-            last_retry = now
-            if connect_wifi(8):
+    if focus.update():
+        screen = 'timer'
+        last_input = time.ticks_ms()
+
+    if (screen != 'clock'
+            and not (screen == 'timer' and focus.state == 'running')
+            and time.ticks_diff(time.ticks_ms(), last_input) > IDLE_RETURN_MS):
+        screen = 'clock'
+
+    render(screen)
+
+    if time.ticks_diff(time.ticks_ms(), last_net) >= 1000:
+        last_net = time.ticks_ms()
+        now = time.time()
+        if not wifi_connected():
+            if now - last_retry > RETRY_EVERY_S:
+                last_retry = now
+                if connect_wifi(8):
+                    synced = ntp_set_rtc()
+                    last_sync = time.time()
+        elif not synced:
+            if now - last_retry > RETRY_EVERY_S:
+                last_retry = now
                 synced = ntp_set_rtc()
                 last_sync = time.time()
-    elif not synced:
-        if now - last_retry > RETRY_EVERY_S:
-            last_retry = now
-            synced = ntp_set_rtc()
-            last_sync = time.time()
-    elif now - last_sync > RESYNC_EVERY_S:
-        if ntp_set_rtc():
-            last_sync = time.time()
+        elif now - last_sync > RESYNC_EVERY_S:
+            if ntp_set_rtc():
+                last_sync = time.time()
+        refresh_weather()
 
-    time.sleep(1)
+    time.sleep_ms(POLL_MS)
