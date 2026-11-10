@@ -26,6 +26,12 @@ gc.enable()
 BRIGHTNESS = 0.55
 NTP_HOST = 'pool.ntp.org'
 RETRY_EVERY_S = 60
+# Network calls block the loop (a weather fetch takes 1-6 s), so they run
+# only once the buttons have been left alone this long.
+NET_QUIET_MS = 3000
+WIFI_ATTEMPT_MS = 15 * 1000     # background join attempt, then next network
+WIFI_FAIL_WAIT_MS = 5 * 1000    # minimum spacing when a join fails outright
+WEATHER_TIMEOUT_S = 6
 RESYNC_EVERY_S = 6 * 3600
 MIN_PLAUSIBLE_YEAR = 2024
 
@@ -80,6 +86,9 @@ display.update()
 
 
 # ---------------- WiFi ----------------
+wifi = {'idx': 0, 'attempt_at': None}
+
+
 def wifi_connected():
     wlan = network.WLAN(network.STA_IF)
     return wlan.isconnected()
@@ -119,7 +128,9 @@ def connect_wifi(timeout_s=15, show=False):
         nets = [n for n in nets if n[0] in visible]
     except OSError:
         pass  # scan failed: try every known network
+    known = known_networks()
     for ssid, psk in nets:
+        wifi['idx'] = known.index((ssid, psk))
         wlan.connect(ssid, psk)
         for _ in range(timeout_s):
             if wlan.status() < 0 or wlan.status() >= 3:
@@ -130,6 +141,35 @@ def connect_wifi(timeout_s=15, show=False):
         if wlan.isconnected():
             return True
         wlan.disconnect()
+    return False
+
+
+def wifi_tick():
+    """Background (re)join that never blocks: start one attempt, look at
+    it on later ticks, and move to the next known network if it fails or
+    takes longer than WIFI_ATTEMPT_MS. Returns True while connected."""
+    wlan = network.WLAN(network.STA_IF)
+    if wlan.isconnected():
+        wifi['attempt_at'] = None
+        return True
+    now = time.ticks_ms()
+    started = wifi['attempt_at']
+    nets = known_networks()
+    if started is not None:
+        age = time.ticks_diff(now, started)
+        failed = wlan.status() < 0
+        if age < WIFI_ATTEMPT_MS and not (failed and age >= WIFI_FAIL_WAIT_MS):
+            return False                      # attempt still in progress
+        wifi['idx'] = (wifi['idx'] + 1) % len(nets)
+    ssid, psk = nets[wifi['idx'] % len(nets)]
+    try:
+        wlan.active(True)
+        if started is not None:
+            wlan.disconnect()        # abandon the stale attempt first
+        wlan.connect(ssid, psk)
+    except OSError:
+        pass
+    wifi['attempt_at'] = now
     return False
 
 
@@ -187,51 +227,72 @@ pressed_at = {}
 hold_fired = {}
 released_at = {}
 
-# The loop only samples the pins between redraws and network calls, so a
-# quick tap can start and end unseen. A falling-edge interrupt latches it.
-# fall_edges counts every electrical press per button (contact bounce
-# included); read it over the REPL to tell a dead switch from a missed tap.
-fell_at = {}
-fall_edges = {'A': 0, 'B': 0, 'X': 0, 'Y': 0}
+# The loop samples the pins only between redraws and network calls, so a
+# press can begin and end unseen. A hard (true hardware) interrupt stamps
+# every falling edge at the moment it happens, even while the loop is
+# blocked, and poll_buttons() hands presses back in the order they were made.
+# The handler must not allocate, so it writes only into these fixed lists.
+# fall_edges counts electrical presses per button (A, B, X, Y order, contact
+# bounce included); read it over the REPL to tell a dead switch from software.
+fell_seen = bytearray(len(BUTTONS))
+fell_first = [0] * len(BUTTONS)
+fell_last = [0] * len(BUTTONS)
+fall_edges = [0] * len(BUTTONS)
 
 
-def _fell(name):
-    fell_at[name] = time.ticks_ms()
-    fall_edges[name] += 1
+def _fell(i):
+    t = time.ticks_ms()
+    if not fell_seen[i]:
+        fell_first[i] = t
+        fell_seen[i] = 1
+    fell_last[i] = t
+    fall_edges[i] += 1
 
 
-for _name, _pin in BUTTONS:
+for _i, (_name, _pin) in enumerate(BUTTONS):
     _pin.irq(trigger=machine.Pin.IRQ_FALLING,
-             handler=lambda _p, n=_name: _fell(n))
+             handler=lambda _p, i=_i: _fell(i), hard=True)
+
+
+def take_edges(i):
+    """(seen, first, last) for button i since the previous call."""
+    irq_state = machine.disable_irq()
+    seen, first, last = fell_seen[i], fell_first[i], fell_last[i]
+    fell_seen[i] = 0
+    machine.enable_irq(irq_state)
+    return seen, first, last
 
 
 def poll_buttons():
-    """Return (name, 'press' | 'hold') events. A press fires on release,
-    a hold fires once after HOLD_MS while still down. A tap that began and
-    ended between two polls is recovered from the edge latch, unless it is
-    contact bounce within DEBOUNCE_MS of the previous release."""
+    """Return (name, 'press' | 'hold') events, oldest press first.
+
+    A press fires on release, a hold once after HOLD_MS while still down.
+    A press that began and ended between two polls comes from the edge
+    stamps, unless it is contact bounce within DEBOUNCE_MS of the previous
+    release."""
     events = []
     now = time.ticks_ms()
-    for name, pin in BUTTONS:
-        fell = fell_at.pop(name, None)
+    for i, (name, pin) in enumerate(BUTTONS):
+        seen, first, last = take_edges(i)
         if pin.value() == 0:
             if name not in pressed_at:
-                pressed_at[name] = now
+                pressed_at[name] = last if seen else now
                 hold_fired[name] = False
             elif not hold_fired[name] and time.ticks_diff(now, pressed_at[name]) >= HOLD_MS:
                 hold_fired[name] = True
-                events.append((name, 'hold'))
+                events.append((pressed_at[name], name, 'hold'))
         elif name in pressed_at:
-            held = time.ticks_diff(now, pressed_at.pop(name))
+            start = pressed_at.pop(name)
             released_at[name] = now
-            if not hold_fired.pop(name) and held >= 20:
-                events.append((name, 'press'))
-        elif fell is not None:
-            last = released_at.get(name)
-            if last is None or time.ticks_diff(fell, last) > DEBOUNCE_MS:
+            if not hold_fired.pop(name) and time.ticks_diff(now, start) >= 20:
+                events.append((start, name, 'press'))
+        elif seen:
+            prev = released_at.get(name)
+            if prev is None or time.ticks_diff(first, prev) > DEBOUNCE_MS:
                 released_at[name] = now
-                events.append((name, 'press'))
-    return events
+                events.append((first, name, 'press'))
+    events.sort(key=lambda e: time.ticks_diff(e[0], now))
+    return [(name, kind) for _t, name, kind in events]
 
 
 # ---------------- focus timer ----------------
@@ -309,7 +370,7 @@ def fetch_weather():
     try:
         import urequests
         gc.collect()
-        r = urequests.get(WEATHER_URL, timeout=10)
+        r = urequests.get(WEATHER_URL, timeout=WEATHER_TIMEOUT_S)
         try:
             if r.status_code != 200:
                 return None
@@ -328,9 +389,15 @@ def fetch_weather():
         return None
 
 
-def refresh_weather(force=False):
+def request_weather():
+    """Ask for a fresh reading on the next quiet network tick (Y on the
+    weather screen). Fetching inline would freeze the buttons."""
+    weather['due'] = time.ticks_ms()
+
+
+def refresh_weather():
     now = time.ticks_ms()
-    if not force and time.ticks_diff(now, weather['due']) < 0:
+    if time.ticks_diff(now, weather['due']) < 0:
         return
     if not wifi_connected():
         return
@@ -531,7 +598,9 @@ if wifi_ok:
 last_retry = time.time()
 last_sync = time.time()
 last_net = time.ticks_ms()
-last_input = time.ticks_ms()
+wifi_up = wifi_ok
+# Count boot as quiet so the first network tick (weather) runs at once.
+last_input = time.ticks_add(time.ticks_ms(), -NET_QUIET_MS)
 screen = 'clock'
 
 while True:
@@ -549,7 +618,7 @@ while True:
             screen = 'timer'
         elif name == 'Y':
             if screen == 'weather' and kind == 'press':
-                refresh_weather(force=True)
+                request_weather()
             screen = 'weather'
 
     if focus.update():
@@ -563,23 +632,23 @@ while True:
 
     render(screen)
 
-    if time.ticks_diff(time.ticks_ms(), last_net) >= 1000:
+    if (time.ticks_diff(time.ticks_ms(), last_net) >= 1000
+            and time.ticks_diff(time.ticks_ms(), last_input) >= NET_QUIET_MS):
         last_net = time.ticks_ms()
         now = time.time()
-        if not wifi_connected():
-            if now - last_retry > RETRY_EVERY_S:
-                last_retry = now
-                if connect_wifi(8):
+        up = wifi_tick()
+        if up and not wifi_up:
+            last_retry = 0          # link just came back: sync now if needed
+        wifi_up = up
+        if up:
+            if not synced:
+                if now - last_retry > RETRY_EVERY_S:
+                    last_retry = now
                     synced = ntp_set_rtc()
                     last_sync = time.time()
-        elif not synced:
-            if now - last_retry > RETRY_EVERY_S:
-                last_retry = now
-                synced = ntp_set_rtc()
-                last_sync = time.time()
-        elif now - last_sync > RESYNC_EVERY_S:
-            if ntp_set_rtc():
-                last_sync = time.time()
-        refresh_weather()
+            elif now - last_sync > RESYNC_EVERY_S:
+                if ntp_set_rtc():
+                    last_sync = time.time()
+            refresh_weather()
 
     time.sleep_ms(POLL_MS)

@@ -77,8 +77,9 @@ class Pin:
     def __init__(self, ident, mode=None, pull=None, value=None):
         self.ident = ident
 
-    def irq(self, trigger=None, handler=None):
+    def irq(self, trigger=None, handler=None, hard=False):
         assert trigger == Pin.IRQ_FALLING
+        assert hard, 'button edges need a hard IRQ to keep their real timing'
         irq_handlers[self.ident] = (self, handler)
 
     def value(self, v=None):
@@ -102,6 +103,8 @@ class RTC:
 machine = types.ModuleType('machine')
 machine.Pin = Pin
 machine.RTC = RTC
+machine.disable_irq = lambda: 0
+machine.enable_irq = lambda state: None
 
 # ---------------- fake network / NTP ----------------
 net_state = {'connected': False}
@@ -121,9 +124,10 @@ class WLAN:
         return [(b'GCMembers', b'', 1, -50, 3, False), (b'Other', b'', 6, -70, 3, False)]
 
     def connect(self, ssid, psk):
-        net_state['connected'] = ssid == 'GCMembers'
+        net_state['connected'] = ssid == 'GCMembers' and not net_state.get('down')
         net_state['ssid'] = ssid
         net_state['connects'] = net_state.get('connects', 0) + 1
+        net_state.setdefault('tried', []).append(ssid)
 
     def status(self):
         return 3 if net_state['connected'] else -2
@@ -179,7 +183,14 @@ class Resp:
 
 def fake_get(url, timeout=None):
     weather_http['calls'] += 1
-    assert timeout == 10, 'weather fetch must pass a timeout'
+    assert timeout == 6, 'weather fetch must pass a short timeout'
+    # Presses made while the fetch blocks the loop: only the edge IRQ sees them.
+    for pin in weather_http.pop('presses_during', ()):
+        button_down[pin] = True
+        edge(pin)
+        clock.elapsed_ms += 120
+        button_down[pin] = False
+        clock.elapsed_ms += 200
     if not weather_http['ok']:
         raise OSError('simulated network failure')
     return Resp()
@@ -339,9 +350,11 @@ def scenario():
                        'Rain', '100%'], texts()
     assert [op[1] for op in frames[-1]['ops']] == ['white', 'teal', 'teal', 'white',
                                                    'teal', 'white', 'teal', 'white']
-    press(Y)   # second press forces a refresh
+    press(Y)   # second press asks for a refresh, made once buttons are quiet
+    assert weather_http['calls'] == 1, ('fetch must not block the button press', weather_http)
+    run_for(3500)
     assert weather_http['calls'] == 2, weather_http
-    checks.append('Y weather rendered, Y again refreshes')
+    checks.append('Y weather rendered, Y again refreshes after 3 s quiet')
 
     # X: timer shows READY 25:00 without starting.
     press(X)
@@ -404,6 +417,7 @@ def scenario():
     weather_http['ok'] = False
     press(Y)
     press(Y)
+    run_for(3500)
     assert texts()[0] == '10\u00b0C', texts()
     assert net_state.get('disconnects', 0) == 0, net_state
     checks.append('failed refresh keeps last reading')
@@ -422,6 +436,53 @@ def scenario():
     run_for(2 * 60 * 1000 + 3000)
     assert weather_http['calls'] > calls and net_state.get('disconnects') == 1, weather_http
     checks.append('fetch recovers after reconnect')
+
+    # Presses made while a fetch blocks the loop are applied in press order,
+    # not in A/B/X/Y order (seen live: 14 of 48 random presses went wrong).
+    def fetch_with_presses(pins):
+        press(Y)
+        press(Y)                     # on weather: request a refresh
+        calls = weather_http['calls']
+        weather_http['presses_during'] = list(pins)
+        run_for(3500)
+        assert weather_http['calls'] == calls + 1 and 'presses_during' not in weather_http
+        run_for(100)
+
+    fetch_with_presses((B, X, A))
+    assert len(texts()) == 2 and texts()[0].isdigit(), ('last press was A', texts())
+    fetch_with_presses((A, Y, B))
+    assert texts() == ['TUESDAY', '10', 'NOV'], ('last press was B', texts())
+    fetch_with_presses((Y, A, X))
+    assert texts()[0] == 'FOCUS', ('last press was X', texts())
+    checks.append('presses during a blocking fetch apply in press order')
+
+    # Network work waits while buttons are in use.
+    press(Y)
+    press(Y)                         # refresh requested
+    calls = weather_http['calls']
+    for pin in (A, B, A, B):
+        run_for(1500)
+        press(pin)
+    assert weather_http['calls'] == calls, 'no fetch while the buttons are in use'
+    run_for(3500)
+    assert weather_http['calls'] == calls + 1, weather_http
+    checks.append('network work deferred until buttons are quiet for 3 s')
+
+    # WiFi down: background joins never block, and both networks are tried.
+    net_state['down'] = True
+    net_state['connected'] = False
+    net_state['tried'] = []
+    for pin, want in ((B, 'TUESDAY'), (A, None), (B, 'TUESDAY'), (A, None)) * 3:
+        run_for(4500)                # quiet: network ticks run join attempts
+        press(pin)
+        got = texts()
+        assert (got[0] == want) if want else (len(got) == 2 and got[0].isdigit()), \
+            ('press not handled at once while WiFi is down', got)
+    assert {'GCMembers', 'CSEFB'} <= set(net_state['tried']), net_state['tried']
+    net_state['down'] = False
+    run_for(25000)
+    assert net_state['connected'], net_state
+    checks.append('WiFi down: presses instant, joins alternate, link recovers')
     raise StopSim
 
 

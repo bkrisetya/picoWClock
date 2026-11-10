@@ -17,11 +17,18 @@ White with a teal accent throughout.
   temperature large (e.g. `10°C`), the condition in words (Sunny,
   Partly cloudy, Rain, ...; Clear at night), a divider, then High, Low
   and Rain chance as aligned rows. Refreshes every 15 minutes; press Y
-  again to refresh now. A reading older than 3 hours shows `No data`.
+  again to refresh (it fetches once the buttons have been left alone for
+  3 s). A reading older than 3 hours shows `No data`.
 
 Any screen other than the clock returns to it after 20 s without a press,
 except while the timer is running. Time comes from NTP with UK GMT/BST
 handling.
+
+Buttons are stamped by a hardware interrupt the moment they go down and
+handled in the order pressed, so no press is lost or reordered even while
+a network call holds the loop. Network work (weather, NTP, WiFi rejoin)
+waits until the buttons have been quiet for 3 s, and background WiFi
+rejoins never block.
 
 Forked from chriskalv/picoWClock (Display Pack 2.0, used as the NTP, DST
 and layout starting point) and adapted by Beltsazar Krisetya,
@@ -38,8 +45,9 @@ November 2026. Divergence from upstream:
   01:00 UTC to last Sunday October 01:00 UTC).
 - The board has no battery-backed clock: after any power loss it shows
   `-- / --` until it reaches a known network and NTP.
-- Failed WiFi/NTP no longer demands a reboot: background retries run every
-  minute without blanking the face, and NTP resyncs every 6 hours.
+- Failed WiFi/NTP no longer demands a reboot: background rejoins cycle
+  through the known networks without blanking the face or blocking the
+  buttons, and NTP resyncs every 6 hours.
 - The pack's RGB LED is driven off at boot (unconfigured, the GPIO
   pull-downs make the red die glow).
 
