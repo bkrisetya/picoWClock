@@ -10,7 +10,9 @@ White with a teal accent throughout.
 - **A** clock (default): hours white on top, minutes teal below, each
   scaled to fill its half of the panel.
 - **B** date: weekday, day number, month.
-- **X** focus timer, 25 minutes: press X again to start or pause; on the
+- **X** focus timer, 25 minutes, shown as one `MM:SS` line under FOCUS
+  with a teal bar that drains as the session runs, so it never reads as
+  the clock's two stacked numbers. Press X again to start or pause; on the
   timer screen, hold X for a second to reset (from any other screen a
   long press only shows the timer, so it cannot wipe a session unseen).
   At zero it switches itself to the timer screen and flashes teal for
