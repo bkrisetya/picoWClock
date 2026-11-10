@@ -254,7 +254,9 @@ CONDITIONS = ((0, 'CLEAR'), (1, 'FAIR'), (2, 'PART CLOUD'), (3, 'CLOUDY'),
               (48, 'FOG'), (57, 'DRIZZLE'), (67, 'RAIN'), (77, 'SNOW'),
               (82, 'SHOWERS'), (86, 'SNOW'), (99, 'STORM'))
 
-weather = {'data': None, 'at': 0, 'due': time.ticks_ms()}
+WEATHER_FAILS_BEFORE_RECONNECT = 3
+
+weather = {'data': None, 'at': 0, 'due': time.ticks_ms(), 'fails': 0}
 
 
 def condition_name(code):
@@ -300,8 +302,15 @@ def refresh_weather(force=False):
         weather['data'] = data
         weather['at'] = now
         weather['due'] = time.ticks_add(now, WEATHER_EVERY_MS)
+        weather['fails'] = 0
     else:
         weather['due'] = time.ticks_add(now, WEATHER_RETRY_MS)
+        weather['fails'] += 1
+        # A link can report connected while passing no TCP (seen live).
+        # Drop it so the main loop's retry makes a clean reconnect.
+        if weather['fails'] >= WEATHER_FAILS_BEFORE_RECONNECT:
+            weather['fails'] = 0
+            network.WLAN(network.STA_IF).disconnect()
 
 
 def current_weather():

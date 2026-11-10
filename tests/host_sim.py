@@ -114,12 +114,14 @@ class WLAN:
     def connect(self, ssid, psk):
         net_state['connected'] = ssid == 'GCMembers'
         net_state['ssid'] = ssid
+        net_state['connects'] = net_state.get('connects', 0) + 1
 
     def status(self):
         return 3 if net_state['connected'] else -2
 
     def disconnect(self):
         net_state['connected'] = False
+        net_state['disconnects'] = net_state.get('disconnects', 0) + 1
 
 
 network = types.ModuleType('network')
@@ -356,7 +358,23 @@ def scenario():
     press(Y)
     press(Y)
     assert texts()[1] == '10C', texts()
+    assert net_state.get('disconnects', 0) == 0, net_state
     checks.append('failed refresh keeps last reading')
+
+    # Background retries every 2 min keep failing; the third consecutive
+    # failure drops the link and the main loop reconnects on its next tick.
+    connects_before = net_state['connects']
+    run_for(4 * 60 * 1000 + 5000)
+    assert net_state.get('disconnects') == 1, net_state
+    assert net_state['connected'] and net_state['connects'] == connects_before + 1, net_state
+    checks.append('3 failed fetches force a clean WiFi reconnect')
+
+    # Network back: next scheduled fetch succeeds and resets the count.
+    weather_http['ok'] = True
+    calls = weather_http['calls']
+    run_for(2 * 60 * 1000 + 3000)
+    assert weather_http['calls'] > calls and net_state.get('disconnects') == 1, weather_http
+    checks.append('fetch recovers after reconnect')
     raise StopSim
 
 
