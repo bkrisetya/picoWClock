@@ -39,14 +39,13 @@ GLOW_MAX_MS = 30 * 60 * 1000
 CRASH_LOG = 'crash.txt'
 NTP_HOST = 'pool.ntp.org'
 RETRY_EVERY_S = 60
-# Network calls block the loop (a weather fetch takes 1-13 s), so they run
-# only once the buttons have been left alone this long.
+# Network calls block the loop (a weather fetch takes 0.1-0.5 s, longer
+# on a stall), so they run only once the buttons have been left alone
+# this long.
 NET_QUIET_MS = 3000
 WIFI_ATTEMPT_MS = 15 * 1000     # background join attempt, then next network
 WIFI_FAIL_WAIT_MS = 5 * 1000    # minimum spacing when a join fails outright
-# On a weak link (CSEFB at -87 dBm) the TLS handshake alone took 6-12.5 s,
-# so a shorter limit failed most fetches and the failures dropped the link.
-WEATHER_TIMEOUT_S = 15
+WEATHER_TIMEOUT_S = 8
 RESYNC_EVERY_S = 6 * 3600
 MIN_PLAUSIBLE_YEAR = 2024
 
@@ -60,7 +59,10 @@ DONE_FLASH_MS = 6 * 1000
 # starting with the current hour (already partly over). Slots 1-4 cover
 # the top of this hour to four hours ahead, so whatever the minute they
 # span the whole of the next three hours.
-WEATHER_URL = ('https://api.open-meteo.com/v1/forecast'
+# Plain HTTP on purpose: on weak campus Wi-Fi (CSEFB, -85 dBm) the TLS
+# handshake took 1.3-12.5 s and froze the buttons, while HTTP took
+# 0.1-0.5 s. The request carries only public coordinates and no key.
+WEATHER_URL = ('http://api.open-meteo.com/v1/forecast'
                '?latitude=51.5246&longitude=-0.1340'
                '&current=temperature_2m,weather_code,is_day'
                '&hourly=precipitation_probability&forecast_hours=5'
@@ -796,10 +798,7 @@ try:
                 elif now - last_sync > RESYNC_EVERY_S:
                     if ntp_set_rtc():
                         last_sync = time.time()
-                # A slow fetch freezes the loop; never do that to a
-                # countdown on screen. It runs once the session ends.
-                if not (screen == 'timer' and focus.state == 'running'):
-                    refresh_weather()
+                refresh_weather()
 
         time.sleep_ms(POLL_MS)
 

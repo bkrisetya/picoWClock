@@ -243,7 +243,9 @@ def fake_get(url, timeout=None):
         clock.elapsed_ms += 200
     if not weather_http['ok']:
         raise OSError('simulated network failure')
-    latency = weather_http.get('latency_s', 0)
+    # Link model: TLS costs extra round trips and crypto on top of HTTP.
+    latency = weather_http.get('tls_s' if url.startswith('https:') else 'plain_s', 0)
+    weather_http['blocked_s'] = min(latency, timeout)
     clock.elapsed_ms += int(min(latency, timeout) * 1000)
     if latency > timeout:
         raise OSError(110, 'ETIMEDOUT')
@@ -359,10 +361,6 @@ def tap(pin):
     edge(pin)
     button_down[pin] = False
     run_for(60)
-
-
-def focus_state():
-    return MAIN_G['g']['focus'].state
 
 
 def run_for(ms):
@@ -666,10 +664,11 @@ def scenario():
     assert backlights[-1] == 0.55, ('07:00 back to full', backlights[-3:])
     checks.append('night dims 22:00-07:00, night glow dimmer, glow ends after 30 min')
 
-    # Weak campus link: on CSEFB at -87 dBm the TLS handshake alone took
-    # 6-12.5 s (measured 10/11/2026). A 12 s fetch must still succeed.
+    # Weak campus link (CSEFB at -85 dBm, measured 10/11/2026): a TLS fetch
+    # took 1.3-12.5 s, plain HTTP 0.1-0.5 s. A fetch blocks the loop, so on
+    # that link it must still succeed and freeze the buttons under a second.
     g = MAIN_G['g']
-    weather_http['latency_s'] = 12
+    weather_http.update(tls_s=12, plain_s=0.5)
     press(Y)
     press(Y)
     calls = weather_http['calls']
@@ -677,29 +676,10 @@ def scenario():
     assert weather_http['calls'] == calls + 1, weather_http
     w = g['weather']
     assert w['fails'] == 0 and w['due'] - g['mono_ms']() > 10 * 60 * 1000, ('slow fetch failed', w)
-    checks.append('weak link: a 12 s weather fetch succeeds')
-
-    # That fetch freezes the loop, so it waits while a focus session counts
-    # down on screen, and runs as soon as the countdown stops.
-    press(X)
-    if texts()[3:] == ['DONE']:
-        press(X)
-    press(X)
-    assert focus_state() == 'running', focus_state()
-    w['due'] = 0
-    calls = weather_http['calls']
-    shown = len(frames)
-    run_for(60 * 1000)
-    assert weather_http['calls'] == calls, 'fetch froze a running countdown'
-    gaps = [b['t'] - a['t'] for a, b in zip(frames[shown:], frames[shown + 1:])]
-    assert gaps and max(gaps) <= 1100, ('countdown froze', max(gaps or [0]))
-    press(X)                                  # pause
-    run_for(3500)
-    assert weather_http['calls'] == calls + 1, weather_http
-    press(X, hold_ms=1200)                    # reset
-    assert texts()[3:] == ['READY'], texts()
-    weather_http['latency_s'] = 0
-    checks.append('no weather fetch while a focus countdown is on screen')
+    assert weather_http['blocked_s'] <= 1, ('fetch froze the buttons', weather_http['blocked_s'])
+    for k in ('tls_s', 'plain_s'):
+        del weather_http[k]
+    checks.append('weak link: weather fetch succeeds and blocks under 1 s')
 
     # Crash guard: an unexpected error is logged and the board restarts
     # instead of freezing on its last frame.
