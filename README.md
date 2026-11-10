@@ -55,8 +55,14 @@ November 2026. Divergence from upstream:
   pico2_w Pimoroni build ships no vector fonts.
 - WiFi credentials moved out of `main.py` into `WIFI_CONFIG.py`
   (git-ignored; copy `WIFI_CONFIG.py.example` and fill it in). It holds a
-  `NETWORKS` list; the clock scans and joins whichever one is in range, so
-  one config works at home and at work.
+  `NETWORKS` list; the clock joins whichever one is in range, so one config
+  works at home and at work. Networks the scan can see go first, strongest
+  first, then the rest, so hidden networks (UCL CS's CSEFB) still join.
+  A weak network that refuses most joins is retried five times, 1.5 s
+  apart, before the clock moves on.
+- Weather uses plain HTTP: on weak Wi-Fi the HTTPS handshake took up to
+  12.5 s and froze the buttons, against 0.1-0.5 s for HTTP. The request
+  carries only public coordinates and no key.
 - RTC stays in UTC; BST is applied at render time (last Sunday March
   01:00 UTC to last Sunday October 01:00 UTC).
 - The board has no battery-backed clock: after any power loss it shows
