@@ -165,8 +165,11 @@ class WLAN:
                                       (b'Other', b'', 6, -70, 3, False)])
 
     def connect(self, ssid, psk):
-        net_state['connected'] = (ssid == net_state.get('joinable', 'GCMembers')
-                                  and not net_state.get('down'))
+        ok = ssid == net_state.get('joinable', 'GCMembers') and not net_state.get('down')
+        if ok and net_state.get('flaky_every'):   # weak link: only every nth join works
+            net_state['flaky_n'] = net_state.get('flaky_n', 0) + 1
+            ok = net_state['flaky_n'] % net_state['flaky_every'] == 0
+        net_state['connected'] = ok
         net_state['ssid'] = ssid
         net_state['connects'] = net_state.get('connects', 0) + 1
         net_state.setdefault('tried', []).append(ssid)
@@ -680,6 +683,18 @@ def scenario():
     for k in ('tls_s', 'plain_s'):
         del weather_http[k]
     checks.append('weak link: weather fetch succeeds and blocks under 1 s')
+
+    # Weak join: hidden CSEFB at -87 dBm accepted 4 of 14 attempts, most
+    # failing in 0.5 s (10/11/2026). Retry it quickly instead of waiting
+    # 5 s and spending every other try on a network that is not there.
+    net_state.update(joinable='CSEFB', flaky_every=4, flaky_n=0, tried=[], connected=False)
+    t0 = clock.elapsed_ms
+    while not net_state['connected'] and clock.elapsed_ms - t0 < 20000:
+        run_for(500)
+    assert net_state['connected'], ('weak network not joined within 20 s', net_state['tried'])
+    for k in ('joinable', 'flaky_every', 'flaky_n'):
+        del net_state[k]
+    checks.append('weak join: a network accepting 1 in 4 joins is up within 20 s')
 
     # Crash guard: an unexpected error is logged and the board restarts
     # instead of freezing on its last frame.

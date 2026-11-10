@@ -43,8 +43,12 @@ RETRY_EVERY_S = 60
 # on a stall), so they run only once the buttons have been left alone
 # this long.
 NET_QUIET_MS = 3000
-WIFI_ATTEMPT_MS = 15 * 1000     # background join attempt, then next network
-WIFI_FAIL_WAIT_MS = 5 * 1000    # minimum spacing when a join fails outright
+WIFI_ATTEMPT_MS = 15 * 1000     # longest a background join attempt may hang
+WIFI_FAIL_WAIT_MS = 1500        # minimum spacing when a join fails outright
+# Attempts on one network before moving to the next. A weak network can
+# refuse most joins yet still work: hidden CSEFB at -87 dBm accepted 4 of
+# 14 back-to-back attempts, most failing within 0.5 s.
+WIFI_TRIES_PER_NET = 5
 WEATHER_TIMEOUT_S = 8
 RESYNC_EVERY_S = 6 * 3600
 MIN_PLAUSIBLE_YEAR = 2024
@@ -125,7 +129,7 @@ display.update()
 
 
 # ---------------- WiFi ----------------
-wifi = {'idx': 0, 'attempt_at': None}
+wifi = {'idx': 0, 'attempt_at': None, 'tries': 0}
 
 
 def wifi_connected():
@@ -190,11 +194,14 @@ def connect_wifi(timeout_s=15, show=False):
 
 def wifi_tick():
     """Background (re)join that never blocks: start one attempt, look at
-    it on later ticks, and move to the next known network if it fails or
-    takes longer than WIFI_ATTEMPT_MS. Returns True while connected."""
+    it on later ticks, and retry when it fails or takes longer than
+    WIFI_ATTEMPT_MS, moving to the next known network after
+    WIFI_TRIES_PER_NET attempts. It starts with the network that last
+    worked. Returns True while connected."""
     wlan = network.WLAN(network.STA_IF)
     if wlan.isconnected():
         wifi['attempt_at'] = None
+        wifi['tries'] = 0
         return True
     now = mono_ms()
     started = wifi['attempt_at']
@@ -204,7 +211,10 @@ def wifi_tick():
         failed = wlan.status() < 0
         if age < WIFI_ATTEMPT_MS and not (failed and age >= WIFI_FAIL_WAIT_MS):
             return False                      # attempt still in progress
-        wifi['idx'] = (wifi['idx'] + 1) % len(nets)
+        wifi['tries'] += 1
+        if wifi['tries'] >= WIFI_TRIES_PER_NET:
+            wifi['tries'] = 0
+            wifi['idx'] = (wifi['idx'] + 1) % len(nets)
     ssid, psk = nets[wifi['idx'] % len(nets)]
     try:
         wlan.active(True)
