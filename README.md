@@ -3,16 +3,19 @@
 Desk clock on a Raspberry Pi Pico 2 W + Pimoroni Display Pack 1.14"
 (PIM543, 240x135), portrait, one screen per button:
 
-- **A** clock (default): hours white on top, minutes orange below, each
+White with a teal accent throughout.
+
+- **A** clock (default): hours white on top, minutes teal below, each
   scaled to fill its half of the panel.
 - **B** date: weekday, day number, month.
 - **X** focus timer, 25 minutes: press X again to start or pause, hold X
   for a second to reset. At zero it switches itself to the timer screen
-  and flashes orange for 6 s, then reads DONE. The RGB LED stays off.
-- **Y** London weather from Open-Meteo (free, no key): condition, current
-  temperature, today's high and low, rain chance. Refreshes every
-  15 minutes; press Y again to refresh now. A reading older than 3 hours
-  is replaced by NO DATA.
+  and flashes teal for 6 s, then reads DONE. The RGB LED stays off.
+- **Y** London weather from Open-Meteo (free, no key): current
+  temperature large (e.g. `10°C`), the condition in words (Sunny,
+  Partly cloudy, Rain, ...; Clear at night), a divider, then High, Low
+  and Rain chance as aligned rows. Refreshes every 15 minutes; press Y
+  again to refresh now. A reading older than 3 hours shows `No data`.
 
 Any screen other than the clock returns to it after 20 s without a press,
 except while the timer is running. Time comes from NTP with UK GMT/BST
@@ -47,7 +50,9 @@ python3 tests/host_sim.py
 Runs the real `main.py` under CPython against stubbed board modules
 (buttons, display, WiFi, NTP, and the recorded Open-Meteo response in
 `tests/open_meteo_sample.json`) and walks every screen and timer path,
-with the tick counter crossing its wrap. Run it before every deploy.
+with the tick counter crossing its wrap. Text widths come from the
+board's own font metrics (`tests/bitmap8_widths.json`), so layout fits are
+checked against real pixels. Run it before every deploy.
 
 ## Deploy
 

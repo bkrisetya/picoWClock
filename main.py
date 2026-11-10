@@ -1,7 +1,7 @@
 # picoWClock - desk clock for Raspberry Pi Pico 2 W + Pimoroni Display Pack
 # 1.14" (PIM543, 240x135), portrait. Fork of chriskalv/picoWClock (Display
 # Pack 2.0), rebuilt for the small panel with one screen per button:
-#   A  clock (default): hours white on top, minutes orange below
+#   A  clock (default): hours white on top, minutes teal below
 #   B  date: weekday, day number, month
 #   X  focus timer, 25 minutes: X again starts or pauses, hold X to reset
 #   Y  London weather from Open-Meteo (no key): Y again refreshes
@@ -37,7 +37,7 @@ DONE_FLASH_MS = 6 * 1000
 
 WEATHER_URL = ('https://api.open-meteo.com/v1/forecast'
                '?latitude=51.5246&longitude=-0.1340'
-               '&current=temperature_2m,weather_code'
+               '&current=temperature_2m,weather_code,is_day'
                '&daily=temperature_2m_max,temperature_2m_min,'
                'precipitation_probability_max'
                '&timezone=Europe%2FLondon&forecast_days=1')
@@ -58,9 +58,12 @@ width, height = display.get_bounds()
 display.set_backlight(BRIGHTNESS)
 display.set_font('bitmap8')
 
+# The framebuffer is RGB332 (3-3-2 bits), so accents are picked on levels
+# that survive the quantisation: teal is green 5/7 with blue 2/3.
 black = display.create_pen(0, 0, 0)
 white = display.create_pen(255, 255, 255)
-orange = display.create_pen(255, 128, 0)
+teal = display.create_pen(0, 182, 170)
+dim_teal = display.create_pen(0, 73, 85)
 
 led_onboard = machine.Pin('LED', machine.Pin.OUT, value=0)
 
@@ -250,25 +253,31 @@ focus = FocusTimer()
 
 
 # ---------------- weather ----------------
-CONDITIONS = ((0, 'CLEAR'), (1, 'FAIR'), (2, 'PART CLOUD'), (3, 'CLOUDY'),
-              (48, 'FOG'), (57, 'DRIZZLE'), (67, 'RAIN'), (77, 'SNOW'),
-              (82, 'SHOWERS'), (86, 'SNOW'), (99, 'STORM'))
+# WMO weather codes, as (highest code in band, name). 0 and 1 depend on
+# day or night and are handled in condition_name().
+CONDITIONS = ((2, 'Partly cloudy'), (3, 'Cloudy'), (48, 'Fog'),
+              (57, 'Drizzle'), (67, 'Rain'), (77, 'Snow'), (82, 'Showers'),
+              (86, 'Snow showers'), (99, 'Thunderstorm'))
 
 WEATHER_FAILS_BEFORE_RECONNECT = 3
 
 weather = {'data': None, 'at': 0, 'due': time.ticks_ms(), 'fails': 0}
 
 
-def condition_name(code):
-    """WMO weather code to a short word (first band whose ceiling fits)."""
+def condition_name(code, is_day=1):
+    """WMO weather code to a short phrase."""
+    if code == 0:
+        return 'Sunny' if is_day else 'Clear'
+    if code == 1:
+        return 'Mostly sunny' if is_day else 'Mostly clear'
     for ceiling, name in CONDITIONS:
         if code <= ceiling:
             return name
-    return 'WEATHER'
+    return 'Unknown'
 
 
 def fetch_weather():
-    """(temp, code, high, low, rain_pct) for London, or None on any failure."""
+    """(temp, code, high, low, rain_pct, is_day) for London, or None."""
     try:
         import urequests
         gc.collect()
@@ -285,7 +294,8 @@ def fetch_weather():
         return (round(cur['temperature_2m']), int(cur['weather_code']),
                 round(day['temperature_2m_max'][0]),
                 round(day['temperature_2m_min'][0]),
-                None if rain is None else int(rain))
+                None if rain is None else int(rain),
+                int(cur.get('is_day', 1)))
     except Exception:
         return None
 
@@ -360,7 +370,7 @@ def draw_clock(tm, synced_time):
         mm = '{:02d}'.format(tm[4])
     else:
         hh = mm = '--'
-    draw_pair(hh, mm, 0, height, white, orange)
+    draw_pair(hh, mm, 0, height, white, teal)
 
 
 def draw_date(tm, synced_time):
@@ -368,9 +378,9 @@ def draw_date(tm, synced_time):
         day_name, day_num, month = DAYS[tm[6]], str(tm[2]), MONTHS[tm[1]]
     else:
         day_name, day_num, month = '--', '--', '--'
-    draw_band(day_name, 0, 60, orange, band_scale(day_name, 0, 60, 4))
+    draw_band(day_name, 0, 60, teal, band_scale(day_name, 0, 60, 4))
     draw_band(day_num, 60, 176, white, band_scale(day_num, 60, 176, 15))
-    draw_band(month, 176, height, orange, band_scale(month, 176, height, 8))
+    draw_band(month, 176, height, teal, band_scale(month, 176, height, 8))
 
 
 def draw_timer(secs, fg, accent):
@@ -382,19 +392,66 @@ def draw_timer(secs, fg, accent):
         draw_band(label, 212, height, fg, band_scale(label, 212, height, 3))
 
 
+# Weather layout (portrait 135 x 240): big temperature, condition caption,
+# a divider, then three label/value rows. Each slot is a fixed band, so the
+# layout never shifts; smaller text is centred inside its band. Spacing:
+# 16 px top and bottom, 18 px either side of the divider, 19 px between rows.
+WX_MARGIN = 10
+WX_HERO = (16, 48, 6, 2 * WX_MARGIN)   # (top y, band height, max scale, side room)
+WX_CAPTION = (76, 24, 3, 8)            # long names may use more width to stay at 2
+WX_DIVIDER_Y = 118
+WX_ROWS_Y = (138, 173, 208)
+WX_ROW_BAND = 16
+WX_ROW_MAX_SCALE = 2   # 3 cannot fit 'High' and '10°C' with a readable gap
+
+
+def degrees_c(value):
+    return '{}\u00b0C'.format('--' if value is None else value)
+
+
+def draw_slot(text, slot, pen):
+    top, band, max_scale, side_room = slot
+    scale = fit_scale(text, width - side_room, max_scale)
+    draw_centred(text, top + (band - 8 * scale) // 2, scale, pen)
+
+
+def row_scale(rows):
+    """One scale for every row: the largest at which each label and value
+    fit side by side with at least two glyph-widths of space between."""
+    scale = WX_ROW_MAX_SCALE
+    room = width - 2 * WX_MARGIN
+    while scale > 1 and any(display.measure_text(label, scale)
+                            + display.measure_text(value, scale)
+                            + 6 * scale > room for label, value in rows):
+        scale -= 1
+    return scale
+
+
 def draw_weather(data):
     if data is None:
-        rows = ('WEATHER', '--', 'NO DATA', '')
+        temp = high = low = rain = None
+        caption = 'No data'
     else:
-        temp, code, high, low, rain = data
-        rows = (condition_name(code), '{}C'.format(temp),
-                'H{} L{}'.format(high, low),
-                'RAIN {}%'.format('--' if rain is None else rain))
-    draw_band(rows[0], 0, 44, orange, band_scale(rows[0], 0, 44, 3))
-    draw_band(rows[1], 44, 150, white, band_scale(rows[1], 44, 150, 12))
-    draw_band(rows[2], 150, 196, white, band_scale(rows[2], 150, 196, 4))
-    if rows[3]:
-        draw_band(rows[3], 196, height, orange, band_scale(rows[3], 196, height, 4))
+        temp, code, high, low, rain, is_day = data
+        caption = condition_name(code, is_day)
+    rows = (('High', degrees_c(high)),
+            ('Low', degrees_c(low)),
+            ('Rain', '--' if rain is None else '{}%'.format(rain)))
+
+    draw_slot(degrees_c(temp), WX_HERO, white)
+    draw_slot(caption, WX_CAPTION, teal)
+
+    display.set_pen(dim_teal)
+    display.rectangle(WX_MARGIN, WX_DIVIDER_Y, width - 2 * WX_MARGIN, 2)
+
+    scale = row_scale(rows)
+    for (label, value), y in zip(rows, WX_ROWS_Y):
+        y += (WX_ROW_BAND - 8 * scale) // 2
+        display.set_pen(teal)
+        display.text(label, WX_MARGIN, y, width, scale)
+        display.set_pen(white)
+        x = width - WX_MARGIN - display.measure_text(value, scale)
+        display.text(value, x, y, width, scale)
 
 
 last_frame = None
@@ -421,7 +478,7 @@ def render(screen):
     last_frame = frame
 
     timer_flash = screen == 'timer' and flash_on
-    display.set_pen(orange if timer_flash else black)
+    display.set_pen(teal if timer_flash else black)
     display.clear()
     if screen == 'clock':
         draw_clock(tm, synced_time)
@@ -431,7 +488,7 @@ def render(screen):
         if timer_flash:
             draw_timer(secs, black, black)
         else:
-            draw_timer(secs, white, orange)
+            draw_timer(secs, white, teal)
     else:
         draw_weather(wx)
     display.update()

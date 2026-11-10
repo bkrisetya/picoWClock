@@ -19,6 +19,8 @@ import types
 HERE = os.path.dirname(os.path.abspath(__file__))
 MAIN = os.path.join(HERE, '..', 'main.py')
 SAMPLE = os.path.join(HERE, 'open_meteo_sample.json')
+with open(os.path.join(HERE, 'bitmap8_widths.json'), encoding='utf-8') as _fh:
+    GLYPH_W = json.load(_fh)['widths']
 
 TICKS_PERIOD = 1 << 30
 TRUE_START = calendar.timegm((2026, 11, 10, 12, 34, 50, 0, 0, 0))
@@ -201,7 +203,8 @@ class PicoGraphics:
         assert f == 'bitmap8', 'this firmware has bitmap fonts only'
 
     def create_pen(self, r, g, b):
-        return {(0, 0, 0): 'black', (255, 255, 255): 'white', (255, 128, 0): 'orange'}[(r, g, b)]
+        return {(0, 0, 0): 'black', (255, 255, 255): 'white',
+                (0, 182, 170): 'teal', (0, 73, 85): 'dim_teal'}[(r, g, b)]
 
     def set_pen(self, p):
         self.pen = p
@@ -211,14 +214,17 @@ class PicoGraphics:
         self.ops = []
 
     def measure_text(self, text, scale):
-        # Conservative: real bitmap8 is 5 px per glyph minus the last gap.
-        return 5 * len(text) * scale
+        # Real bitmap8 metrics recorded from the board (tests/bitmap8_widths.json).
+        return scale * (sum(GLYPH_W[c] for c in text) + max(0, len(text) - 1))
 
     def text(self, text, x, y, wrap, scale):
         assert isinstance(scale, int) and scale >= 1, scale
         assert x >= 0 and x + self.measure_text(text, scale) <= self.w + scale, (text, x, scale)
         assert y >= 0 and y + 8 * scale <= self.h, (text, y, scale)
-        self.ops.append((text, self.pen, scale))
+        self.ops.append((text, self.pen, scale, x, y))
+
+    def rectangle(self, x, y, w, h):
+        assert x >= 0 and y >= 0 and x + w <= self.w and y + h <= self.h, (x, y, w, h)
 
     def update(self):
         frames.append({'bg': self.bg, 'ops': list(self.ops), 't': clock.elapsed_ms})
@@ -284,7 +290,7 @@ def scenario():
     assert led_rgb == [(0, 0, 0)], led_rgb
     assert net_state.get('ssid') == 'GCMembers'
     assert texts() == ['12', '34'], texts()
-    assert [op[1] for op in frames[-1]['ops']] == ['white', 'orange']
+    assert [op[1] for op in frames[-1]['ops']] == ['white', 'teal']
     checks.append('boot: NTP sync from 2021, clock 12:34, LED off')
 
     # Weather fetched in the background within the first net tick.
@@ -300,7 +306,10 @@ def scenario():
 
     # Y: weather from the real Open-Meteo sample.
     press(Y)
-    assert texts() == ['CLOUDY', '10C', 'H10 L6', 'RAIN 100%'], texts()
+    assert texts() == ['10\u00b0C', 'Cloudy', 'High', '10\u00b0C', 'Low', '6\u00b0C',
+                       'Rain', '100%'], texts()
+    assert [op[1] for op in frames[-1]['ops']] == ['white', 'teal', 'teal', 'white',
+                                                   'teal', 'white', 'teal', 'white']
     press(Y)   # second press forces a refresh
     assert weather_http['calls'] == 2, weather_http
     checks.append('Y weather rendered, Y again refreshes')
@@ -339,13 +348,13 @@ def scenario():
     assert texts()[0] == 'FOCUS', 'finish switches to timer'
     flash_bgs = {f['bg'] for f in frames if f['ops'] and f['ops'][0][0] == 'FOCUS'
                  and clock.elapsed_ms - f['t'] < 4000}
-    assert 'orange' in flash_bgs and 'black' in flash_bgs, flash_bgs
+    assert 'teal' in flash_bgs and 'black' in flash_bgs, flash_bgs
     run_for(5000)
     assert texts() == ['FOCUS', '00', '00', 'DONE'], texts()
     assert frames[-1]['bg'] == 'black'
     run_for(20000)
     assert len(texts()) == 2, 'done screen returns to clock'
-    checks.append('25 min finish: auto-switch, orange flash, DONE, return')
+    checks.append('25 min finish: auto-switch, teal flash, DONE, return')
 
     # X on DONE resets.
     press(X)
@@ -357,7 +366,7 @@ def scenario():
     weather_http['ok'] = False
     press(Y)
     press(Y)
-    assert texts()[1] == '10C', texts()
+    assert texts()[0] == '10\u00b0C', texts()
     assert net_state.get('disconnects', 0) == 0, net_state
     checks.append('failed refresh keeps last reading')
 
@@ -431,11 +440,37 @@ def main():
     assert g['is_bst'](ts(2026, 10, 25, 0, 59, 59))
     assert not g['is_bst'](ts(2026, 10, 25, 1, 0, 0))
     checks.append('BST edges 29 Mar / 25 Oct 2026 at 01:00 UTC')
-    names = {c: g['condition_name'](c) for c in (0, 1, 2, 3, 45, 53, 63, 73, 81, 85, 96)}
-    assert names == {0: 'CLEAR', 1: 'FAIR', 2: 'PART CLOUD', 3: 'CLOUDY', 45: 'FOG',
-                     53: 'DRIZZLE', 63: 'RAIN', 73: 'SNOW', 81: 'SHOWERS',
-                     85: 'SNOW', 96: 'STORM'}, names
+    cn = g['condition_name']
+    names = {c: cn(c) for c in (0, 1, 2, 3, 45, 53, 63, 73, 81, 85, 96)}
+    assert names == {0: 'Sunny', 1: 'Mostly sunny', 2: 'Partly cloudy', 3: 'Cloudy',
+                     45: 'Fog', 53: 'Drizzle', 63: 'Rain', 73: 'Snow', 81: 'Showers',
+                     85: 'Snow showers', 96: 'Thunderstorm'}, names
+    assert (cn(0, 0), cn(1, 0)) == ('Clear', 'Mostly clear')
     checks.append('WMO code names')
+
+    # Weather layout edge cases: no data, and a cold night with long values.
+    disp = g['display']
+    for data, want in ((None, ['--\u00b0C', 'No data', 'High', '--\u00b0C', 'Low', '--\u00b0C',
+                               'Rain', '--']),
+                       ((-12, 85, -10, -15, 100, 0), ['-12\u00b0C', 'Snow showers', 'High',
+                                                    '-10\u00b0C', 'Low', '-15\u00b0C',
+                                                    'Rain', '100%'])):
+        disp.set_pen('black')
+        disp.clear()
+        g['draw_weather'](data)
+        got = [op[0] for op in disp.ops]
+        assert got == want, got
+        # Size 6 for normal readings; '-12°C' is 126 px at 6, so it steps to 5.
+        want_hero = 6 if data is None or data[0] > -10 else 5
+        assert disp.ops[0][2] == want_hero, ('hero size', disp.ops[0])
+        assert disp.ops[1][2] >= 2, ('caption must never fall to size 1', disp.ops[1])
+        rows = disp.ops[2:]
+        scales = {op[2] for op in rows}
+        assert len(scales) == 1, 'rows share one scale'
+        for label, value in zip(rows[0::2], rows[1::2]):
+            assert label[4] == value[4], 'label and value on one baseline'
+            assert label[3] + disp.measure_text(label[0], label[2]) < value[3], (label, value)
+    checks.append('weather no-data and cold-night layouts fit, rows aligned')
 
     for c in checks:
         print('PASS', c)
