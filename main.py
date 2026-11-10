@@ -182,16 +182,38 @@ def uk_time():
 # ---------------- buttons ----------------
 BUTTONS = [(name, machine.Pin(pin, machine.Pin.IN, machine.Pin.PULL_UP))
            for name, pin in (('A', 12), ('B', 13), ('X', 14), ('Y', 15))]
+DEBOUNCE_MS = 80
 pressed_at = {}
 hold_fired = {}
+released_at = {}
+
+# The loop only samples the pins between redraws and network calls, so a
+# quick tap can start and end unseen. A falling-edge interrupt latches it.
+# fall_edges counts every electrical press per button (contact bounce
+# included); read it over the REPL to tell a dead switch from a missed tap.
+fell_at = {}
+fall_edges = {'A': 0, 'B': 0, 'X': 0, 'Y': 0}
+
+
+def _fell(name):
+    fell_at[name] = time.ticks_ms()
+    fall_edges[name] += 1
+
+
+for _name, _pin in BUTTONS:
+    _pin.irq(trigger=machine.Pin.IRQ_FALLING,
+             handler=lambda _p, n=_name: _fell(n))
 
 
 def poll_buttons():
     """Return (name, 'press' | 'hold') events. A press fires on release,
-    a hold fires once after HOLD_MS while still down."""
+    a hold fires once after HOLD_MS while still down. A tap that began and
+    ended between two polls is recovered from the edge latch, unless it is
+    contact bounce within DEBOUNCE_MS of the previous release."""
     events = []
     now = time.ticks_ms()
     for name, pin in BUTTONS:
+        fell = fell_at.pop(name, None)
         if pin.value() == 0:
             if name not in pressed_at:
                 pressed_at[name] = now
@@ -201,7 +223,13 @@ def poll_buttons():
                 events.append((name, 'hold'))
         elif name in pressed_at:
             held = time.ticks_diff(now, pressed_at.pop(name))
+            released_at[name] = now
             if not hold_fired.pop(name) and held >= 20:
+                events.append((name, 'press'))
+        elif fell is not None:
+            last = released_at.get(name)
+            if last is None or time.ticks_diff(fell, last) > DEBOUNCE_MS:
+                released_at[name] = now
                 events.append((name, 'press'))
     return events
 

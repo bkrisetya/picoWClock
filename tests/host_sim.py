@@ -68,11 +68,18 @@ button_down = {12: False, 13: False, 14: False, 15: False}
 led_rgb = []
 
 
+irq_handlers = {}
+
+
 class Pin:
-    IN, OUT, PULL_UP = 0, 1, 2
+    IN, OUT, PULL_UP, IRQ_FALLING = 0, 1, 2, 4
 
     def __init__(self, ident, mode=None, pull=None, value=None):
         self.ident = ident
+
+    def irq(self, trigger=None, handler=None):
+        assert trigger == Pin.IRQ_FALLING
+        irq_handlers[self.ident] = (self, handler)
 
     def value(self, v=None):
         if self.ident in button_down:
@@ -262,10 +269,25 @@ def texts():
     return [op[0] for op in frames[-1]['ops']]
 
 
+def edge(pin):
+    """Fire the falling-edge interrupt, as the real pin would."""
+    obj, handler = irq_handlers[pin]
+    handler(obj)
+
+
 def press(pin, hold_ms=100):
     """Script a press: down now, up after hold_ms (simulated)."""
     button_down[pin] = True
+    edge(pin)
     run_for(hold_ms)
+    button_down[pin] = False
+    run_for(60)
+
+
+def tap(pin):
+    """A tap that starts and ends between two polls: only the edge is seen."""
+    button_down[pin] = True
+    edge(pin)
     button_down[pin] = False
     run_for(60)
 
@@ -304,6 +326,13 @@ def scenario():
     assert texts()[0].isdigit() and len(texts()) == 2, texts()
     checks.append('B date, idle return to clock after 20 s')
 
+    # A tap shorter than one loop pass is recovered from the edge latch.
+    tap(B)
+    assert texts() == ['TUESDAY', '10', 'NOV'], ('quick tap on B missed', texts())
+    press(A)
+    assert len(texts()) == 2 and texts()[0].isdigit(), texts()
+    checks.append('quick B tap between polls still opens the date')
+
     # Y: weather from the real Open-Meteo sample.
     press(Y)
     assert texts() == ['10\u00b0C', 'Cloudy', 'High', '10\u00b0C', 'Low', '6\u00b0C',
@@ -324,6 +353,15 @@ def scenario():
     run_for(30000)
     assert texts()[0] == 'FOCUS', 'running timer must not return to clock'
     checks.append('X start, countdown, no idle return while running')
+
+    # Contact bounce just after a release must not toggle the timer again.
+    press(X)                       # pause
+    edge(X)                        # bounce edge after release, pin already up
+    run_for(60)
+    assert texts()[3:] == ['PAUSED'], ('bounce re-toggled the timer', texts())
+    press(X)                       # resume
+    assert len(texts()) == 3, ('timer should be running again', texts())
+    checks.append('release bounce ignored, timer toggles once per press')
 
     # Pause holds the value; idle return still applies when paused.
     press(X)
