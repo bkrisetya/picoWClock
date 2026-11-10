@@ -36,14 +36,8 @@ display.set_font('bitmap8')
 
 black = display.create_pen(0, 0, 0)
 white = display.create_pen(255, 255, 255)
-orange = display.create_pen(255, 128, 0)
 
 led_onboard = machine.Pin('LED', machine.Pin.OUT, value=0)
-
-MONTHS = (None, 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-          'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec')
-DAYS = ('Monday', 'Tuesday', 'Wednesday', 'Thursday',
-        'Friday', 'Saturday', 'Sunday')
 
 display.set_pen(black)
 display.clear()
@@ -149,16 +143,13 @@ def draw_clock():
     if year < MIN_PLAUSIBLE_YEAR:
         display.set_pen(black)
         display.clear()
-        draw_centred('--:--', 30, 6, white)
-        draw_centred('waiting for time sync', 96, 1, orange)
+        draw_centred('--:--', (height - 64) // 2, 8, white)
     else:
         hhmm = '{:02d}:{:02d}'.format(hour, minute)
-        date_str = '{} {} {}'.format(day, MONTHS[month], year)
+        scale = fit_scale(hhmm, 232, 8)
         display.set_pen(black)
         display.clear()
-        draw_centred(hhmm, 14, fit_scale(hhmm, 210, 7), white)
-        draw_centred(DAYS[weekday], 76, fit_scale(DAYS[weekday], 220, 2), orange)
-        draw_centred(date_str, 102, fit_scale(date_str, 220, 2), orange)
+        draw_centred(hhmm, (height - 8 * scale) // 2, scale, white)
     display.update()
 
 
