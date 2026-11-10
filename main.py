@@ -56,6 +56,24 @@ DAYS = ('MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY',
 MONTHS = (None, 'JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN',
           'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC')
 
+# ---------------- monotonic time ----------------
+# ticks_ms() wraps every 2**30 ms (12.4 days) and ticks_diff() is only
+# valid for stamps less than half that apart, so a stamp left alone for a
+# week (the last press, the last weather reading) would read as recent or
+# in the future. Every stamp that can age is therefore kept on this
+# non-wrapping millisecond count, advanced by the loop many times a second.
+# Only the button interrupt keeps raw ticks (it must not allocate), and
+# those stamps are consumed within one loop pass.
+_mono = [0, time.ticks_ms()]
+
+
+def mono_ms():
+    t = time.ticks_ms()
+    _mono[0] += time.ticks_diff(t, _mono[1])
+    _mono[1] = t
+    return _mono[0]
+
+
 # ---------------- display ----------------
 from picographics import PicoGraphics, DISPLAY_PICO_DISPLAY
 
@@ -152,11 +170,11 @@ def wifi_tick():
     if wlan.isconnected():
         wifi['attempt_at'] = None
         return True
-    now = time.ticks_ms()
+    now = mono_ms()
     started = wifi['attempt_at']
     nets = known_networks()
     if started is not None:
-        age = time.ticks_diff(now, started)
+        age = now - started
         failed = wlan.status() < 0
         if age < WIFI_ATTEMPT_MS and not (failed and age >= WIFI_FAIL_WAIT_MS):
             return False                      # attempt still in progress
@@ -254,51 +272,61 @@ for _i, (_name, _pin) in enumerate(BUTTONS):
              handler=lambda _p, i=_i: _fell(i), hard=True)
 
 
-def take_edges(i):
-    """(seen, first, last) for button i since the previous call."""
+def take_edges(i, now):
+    """(seen, first, last) for button i since the previous call, with the
+    interrupt's tick stamps moved onto mono_ms() (now)."""
     irq_state = machine.disable_irq()
     seen, first, last = fell_seen[i], fell_first[i], fell_last[i]
     fell_seen[i] = 0
     machine.enable_irq(irq_state)
-    return seen, first, last
+    if not seen:
+        return 0, 0, 0
+    t = _mono[1]
+    return seen, now - time.ticks_diff(t, first), now - time.ticks_diff(t, last)
 
 
 def poll_buttons():
     """Return (name, 'press' | 'hold') events, oldest press first.
 
     A press fires on release, a hold once after HOLD_MS while still down.
-    A press that began and ended between two polls comes from the edge
-    stamps, unless it is contact bounce within DEBOUNCE_MS of the previous
-    release."""
+    A press that began and ended between two polls is recovered from the
+    edge stamps one poll later, unless it is contact bounce within
+    DEBOUNCE_MS of the previous release."""
     events = []
-    now = time.ticks_ms()
+    now = mono_ms()
     for i, (name, pin) in enumerate(BUTTONS):
-        seen, first, last = take_edges(i)
+        seen, first, last = take_edges(i, now)
         if pin.value() == 0:
             if name not in pressed_at:
                 pressed_at[name] = last if seen else now
                 hold_fired[name] = False
-            elif not hold_fired[name] and time.ticks_diff(now, pressed_at[name]) >= HOLD_MS:
+            elif not hold_fired[name] and now - pressed_at[name] >= HOLD_MS:
                 hold_fired[name] = True
                 events.append((pressed_at[name], name, 'hold'))
         elif name in pressed_at:
             start = pressed_at.pop(name)
             released_at[name] = now
-            if not hold_fired.pop(name) and time.ticks_diff(now, start) >= 20:
+            if not hold_fired.pop(name) and now - start >= 20:
                 events.append((start, name, 'press'))
         elif seen:
+            # Pin up, but it fell since the last poll: either a whole tap
+            # made while the loop was busy, or a poll that sampled a gap in
+            # the contact bounce of a press still going down. Mark it down
+            # and let the next poll decide: up again means a tap, down means
+            # a press in progress, and either way it fires once on release.
+            # Edges just after the last release are release bounce.
             prev = released_at.get(name)
-            if prev is None or time.ticks_diff(first, prev) > DEBOUNCE_MS:
-                released_at[name] = now
-                events.append((first, name, 'press'))
-    events.sort(key=lambda e: time.ticks_diff(e[0], now))
+            if prev is None or first - prev > DEBOUNCE_MS:
+                pressed_at[name] = first
+                hold_fired[name] = False
+    events.sort(key=lambda e: e[0])
     return [(name, kind) for _t, name, kind in events]
 
 
 # ---------------- focus timer ----------------
 class FocusTimer:
-    """25-minute countdown on the monotonic tick clock, so an NTP step of
-    the RTC never disturbs it."""
+    """25-minute countdown on mono_ms(), so an NTP step of the RTC never
+    disturbs it."""
 
     def __init__(self):
         self.reset()
@@ -311,12 +339,12 @@ class FocusTimer:
 
     def remaining(self):
         if self.state == 'running':
-            return max(0, time.ticks_diff(self.end, time.ticks_ms()))
+            return max(0, self.end - mono_ms())
         return self.left
 
     def toggle(self):
         if self.state in ('ready', 'paused'):
-            self.end = time.ticks_add(time.ticks_ms(), self.left)
+            self.end = mono_ms() + self.left
             self.state = 'running'
         elif self.state == 'running':
             self.left = self.remaining()
@@ -329,13 +357,13 @@ class FocusTimer:
         if self.state == 'running' and self.remaining() == 0:
             self.state = 'done'
             self.left = 0
-            self.done_at = time.ticks_ms()
+            self.done_at = mono_ms()
             return True
         return False
 
     def flashing(self):
         return (self.state == 'done'
-                and time.ticks_diff(time.ticks_ms(), self.done_at) < DONE_FLASH_MS)
+                and mono_ms() - self.done_at < DONE_FLASH_MS)
 
 
 focus = FocusTimer()
@@ -350,7 +378,7 @@ CONDITIONS = ((2, 'Partly cloudy'), (3, 'Cloudy'), (48, 'Fog'),
 
 WEATHER_FAILS_BEFORE_RECONNECT = 3
 
-weather = {'data': None, 'at': 0, 'due': time.ticks_ms(), 'fails': 0}
+weather = {'data': None, 'at': 0, 'due': mono_ms(), 'fails': 0}
 
 
 def condition_name(code, is_day=1):
@@ -392,24 +420,23 @@ def fetch_weather():
 def request_weather():
     """Ask for a fresh reading on the next quiet network tick (Y on the
     weather screen). Fetching inline would freeze the buttons."""
-    weather['due'] = time.ticks_ms()
+    weather['due'] = mono_ms()
 
 
 def refresh_weather():
-    now = time.ticks_ms()
-    if time.ticks_diff(now, weather['due']) < 0:
+    if mono_ms() < weather['due']:
         return
     if not wifi_connected():
         return
     data = fetch_weather()
-    now = time.ticks_ms()
+    now = mono_ms()
     if data:
         weather['data'] = data
         weather['at'] = now
-        weather['due'] = time.ticks_add(now, WEATHER_EVERY_MS)
+        weather['due'] = now + WEATHER_EVERY_MS
         weather['fails'] = 0
     else:
-        weather['due'] = time.ticks_add(now, WEATHER_RETRY_MS)
+        weather['due'] = now + WEATHER_RETRY_MS
         weather['fails'] += 1
         # A link can report connected while passing no TCP (seen live).
         # Drop it so the main loop's retry makes a clean reconnect.
@@ -421,7 +448,7 @@ def refresh_weather():
 def current_weather():
     if weather['data'] is None:
         return None
-    if time.ticks_diff(time.ticks_ms(), weather['at']) > WEATHER_MAX_AGE_MS:
+    if mono_ms() - weather['at'] > WEATHER_MAX_AGE_MS:
         return None
     return weather['data']
 
@@ -558,7 +585,7 @@ def render(screen):
     tm = uk_time()
     synced_time = tm[0] >= MIN_PLAUSIBLE_YEAR
     secs = (focus.remaining() + 999) // 1000
-    flash_on = focus.flashing() and (time.ticks_ms() // 500) % 2 == 0
+    flash_on = focus.flashing() and (mono_ms() // 500) % 2 == 0
     wx = current_weather()
     if screen == 'clock':
         frame = ('clock', synced_time, tm[3], tm[4])
@@ -597,15 +624,15 @@ if wifi_ok:
 
 last_retry = time.time()
 last_sync = time.time()
-last_net = time.ticks_ms()
+last_net = mono_ms()
 wifi_up = wifi_ok
 # Count boot as quiet so the first network tick (weather) runs at once.
-last_input = time.ticks_add(time.ticks_ms(), -NET_QUIET_MS)
+last_input = mono_ms() - NET_QUIET_MS
 screen = 'clock'
 
 while True:
     for name, kind in poll_buttons():
-        last_input = time.ticks_ms()
+        last_input = mono_ms()
         if name == 'A':
             screen = 'clock'
         elif name == 'B':
@@ -623,18 +650,17 @@ while True:
 
     if focus.update():
         screen = 'timer'
-        last_input = time.ticks_ms()
+        last_input = mono_ms()
 
     if (screen != 'clock'
             and not (screen == 'timer' and focus.state == 'running')
-            and time.ticks_diff(time.ticks_ms(), last_input) > IDLE_RETURN_MS):
+            and mono_ms() - last_input > IDLE_RETURN_MS):
         screen = 'clock'
 
     render(screen)
 
-    if (time.ticks_diff(time.ticks_ms(), last_net) >= 1000
-            and time.ticks_diff(time.ticks_ms(), last_input) >= NET_QUIET_MS):
-        last_net = time.ticks_ms()
+    if mono_ms() - last_net >= 1000 and mono_ms() - last_input >= NET_QUIET_MS:
+        last_net = mono_ms()
         now = time.time()
         up = wifi_tick()
         if up and not wifi_up:

@@ -147,7 +147,7 @@ class Sock:
         pass
 
     def sendto(self, data, addr):
-        pass
+        net_state['ntp'] = net_state.get('ntp', 0) + 1
 
     def recv(self, n):
         pkt = bytearray(48)
@@ -376,6 +376,24 @@ def scenario():
     assert len(texts()) == 3, ('timer should be running again', texts())
     checks.append('release bounce ignored, timer toggles once per press')
 
+    # A poll landing in a gap of the contact bounce as X goes down sees an
+    # edge with the pin up. That must not count as a tap plus a press (it
+    # toggled the timer twice on the board: start then pause at once).
+    run_for(500)                   # well clear of the last release
+    before = texts()[3:]
+    edge(X)                        # first contact, pin bounces back up
+    yield_point()                  # exactly one loop pass samples the gap
+    button_down[X] = True          # contact settles: held
+    edge(X)
+    run_for(150)
+    button_down[X] = False
+    run_for(100)
+    after = texts()[3:]
+    assert after != before, ('press bounce toggled the timer twice', before, after)
+    press(X)                       # restore the previous state for what follows
+    assert texts()[3:] == before, (before, texts())
+    checks.append('press bounce sampled mid-gap toggles the timer once')
+
     # Pause holds the value; idle return still applies when paused.
     press(X)
     paused = texts()[:4]
@@ -483,6 +501,34 @@ def scenario():
     run_for(25000)
     assert net_state['connected'], net_state
     checks.append('WiFi down: presses instant, joins alternate, link recovers')
+
+    # ticks_ms() wraps every 12.4 days and ticks_diff() lies about stamps
+    # more than 6.2 days apart. A clock nobody touches for a week must keep
+    # fetching and syncing, then still take a quick tap and age its data.
+    def idle_days(days):
+        per_day = []
+        for _day in range(days):
+            fetches, syncs = weather_http['calls'], net_state.get('ntp', 0)
+            for _step in range(144):             # 10-minute steps
+                clock.elapsed_ms += 10 * 60 * 1000
+                run_for(2000)                    # a burst of loop passes
+            per_day.append((weather_http['calls'] - fetches,
+                            net_state.get('ntp', 0) - syncs))
+        return per_day
+
+    per_day = idle_days(8)
+    assert all(f >= 24 and s >= 1 for f, s in per_day), \
+        ('network work stopped during a week without presses', per_day)
+    tap(B)                                       # last B release was 8 days ago
+    assert len(texts()) == 3 and texts()[0].endswith('DAY'), \
+        ('quick tap after a week read as bounce', texts())
+    press(A)
+    weather_http['ok'] = False                   # a week of failed fetches
+    idle_days(7)
+    press(Y)
+    assert texts()[:2] == ['--\u00b0C', 'No data'], ('week-old reading shown', texts())
+    weather_http['ok'] = True
+    checks.append('8 untouched days: fetches and NTP continue, tap seen, old data ages out')
     raise StopSim
 
 
