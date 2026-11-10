@@ -32,7 +32,7 @@ from picographics import PicoGraphics, DISPLAY_PICO_DISPLAY
 display = PicoGraphics(display=DISPLAY_PICO_DISPLAY, rotate=0)
 width, height = display.get_bounds()
 display.set_backlight(BRIGHTNESS)
-display.set_font('sans')
+display.set_font('bitmap8')
 
 black = display.create_pen(0, 0, 0)
 white = display.create_pen(255, 255, 255)
@@ -130,9 +130,10 @@ def uk_time():
 
 # ---------------- drawing ----------------
 def fit_scale(text, max_w, start):
-    scale = start
-    while scale > 0.2 and display.measure_text(text, scale) > max_w:
-        scale -= 0.05
+    """Largest integer bitmap scale whose rendered width fits max_w."""
+    scale = int(start)
+    while scale > 1 and display.measure_text(text, scale) > max_w:
+        scale -= 1
     return scale
 
 
@@ -148,16 +149,16 @@ def draw_clock():
     if year < MIN_PLAUSIBLE_YEAR:
         display.set_pen(black)
         display.clear()
-        draw_centred('--:--', 30, 2.6, white)
-        draw_centred('waiting for time sync', 96, 0.6, orange)
+        draw_centred('--:--', 30, 6, white)
+        draw_centred('waiting for time sync', 96, 1, orange)
     else:
         hhmm = '{:02d}:{:02d}'.format(hour, minute)
         date_str = '{} {} {}'.format(day, MONTHS[month], year)
         display.set_pen(black)
         display.clear()
-        draw_centred(hhmm, 8, fit_scale(hhmm, 210, 3.0), white)
-        draw_centred(DAYS[weekday], 86, fit_scale(DAYS[weekday], 220, 0.9), orange)
-        draw_centred(date_str, 110, fit_scale(date_str, 220, 0.75), orange)
+        draw_centred(hhmm, 14, fit_scale(hhmm, 210, 7), white)
+        draw_centred(DAYS[weekday], 76, fit_scale(DAYS[weekday], 220, 2), orange)
+        draw_centred(date_str, 102, fit_scale(date_str, 220, 2), orange)
     display.update()
 
 
