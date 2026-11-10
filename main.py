@@ -616,12 +616,27 @@ def draw_date(tm, synced_time):
 TIMER_BAR = (10, 160, 12)   # (side margin, top y, height)
 
 
+def draw_countdown(mm, ss, y0, y1, pen):
+    """'MM:SS' on one line. The font's own colon sits a pixel from each
+    digit, so it is drawn on its own with two glyph-widths either side.
+    The size is fixed by the widest digits, so it never jumps mid-session."""
+    scale = 6
+    while scale > 1 and 2 * display.measure_text('00', scale) + 5 * scale > width - 8:
+        scale -= 1
+    wm = display.measure_text(mm, scale)
+    x = (width - wm - display.measure_text(ss, scale) - 5 * scale) // 2
+    y = y0 + (y1 - y0 - 8 * scale) // 2
+    display.set_pen(pen)
+    display.text(mm, x, y, width, scale)
+    display.text(':', x + wm + 2 * scale, y, width, scale)
+    display.text(ss, x + wm + 5 * scale, y, width, scale)
+
+
 def draw_timer(secs, flash):
     fg, accent = (black, black) if flash else (white, teal)
     label = {'ready': 'READY', 'paused': 'PAUSED', 'done': 'DONE'}.get(focus.state, '')
     draw_band('FOCUS', 0, 40, accent, band_scale('FOCUS', 0, 40, 3))
-    digits = '{:02d}:{:02d}'.format(secs // 60, secs % 60)
-    draw_band(digits, 40, 150, fg, band_scale(digits, 40, 150, 6))
+    draw_countdown('{:02d}'.format(secs // 60), '{:02d}'.format(secs % 60), 40, 150, fg)
     margin, top, tall = TIMER_BAR
     full = width - 2 * margin
     left = (full * secs + FOCUS_MS // 1000 - 1) // (FOCUS_MS // 1000)
