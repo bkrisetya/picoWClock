@@ -25,6 +25,7 @@ import usocket as socket
 import ustruct as struct
 
 import WIFI_CONFIG
+from usb_host import USBHost
 
 gc.enable()
 
@@ -481,6 +482,7 @@ CONDITIONS = ((2, 'Partly cloudy'), (3, 'Cloudy'), (48, 'Fog'),
 WEATHER_FAILS_BEFORE_RECONNECT = 3
 
 weather = {'data': None, 'at': 0, 'due': mono_ms(), 'fails': 0}
+usb = USBHost()
 
 
 def condition_name(code, is_day=1):
@@ -786,6 +788,7 @@ try:
     screen = 'clock'
 
     while True:
+        usb.tick(weather, mono_ms())
         for name, kind in poll_buttons():
             last_input = mono_ms()
             glow['since'] = None    # any press acknowledges a finished session
@@ -820,7 +823,8 @@ try:
 
         render(screen)
 
-        if mono_ms() - last_net >= 1000 and mono_ms() - last_input >= NET_QUIET_MS:
+        if (not usb.recent(mono_ms()) and mono_ms() - last_net >= 1000
+                and mono_ms() - last_input >= NET_QUIET_MS):
             last_net = mono_ms()
             now = time.time()
             up = wifi_tick()
