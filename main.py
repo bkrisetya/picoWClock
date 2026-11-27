@@ -753,6 +753,37 @@ def render(screen):
     display.update()
 
 
+# ---------------- silent USB activity history ----------------
+# RP2350 USB SIE_STATUS: CONNECTED bit 16, SUSPENDED bit 4.
+# A suspended link is not proof that a laptop was physically unplugged.
+dock_log = None
+dock_log_error = None
+
+
+def init_dock_log():
+    global dock_log, dock_log_error
+    try:
+        from docklog import DockLog
+        dock_log = DockLog(lambda: machine.mem32[0x50110050])
+    except Exception as e:
+        dock_log_error = str(e)[:96]
+
+
+def dock_tick():
+    if dock_log is None or dock_log.error:
+        return
+    try:
+        now = mono_ms()
+        if now < dock_log.next_poll:
+            return
+        t = time.gmtime()
+        utc = ('{:04d}-{:02d}-{:02d}T{:02d}:{:02d}:{:02d}Z'.format(*t[:6])
+               if t[0] >= MIN_PLAUSIBLE_YEAR else None)
+        dock_log.tick(now, utc)
+    except Exception as e:
+        dock_log.error = str(e)[:96]
+
+
 # ---------------- crash guard ----------------
 def log_crash(e):
     """Keep the latest unexpected error (overwritten, so it stays small)."""
@@ -773,6 +804,8 @@ def log_crash(e):
 try:
     # ---------------- startup ----------------
     synced = False
+    init_dock_log()
+    dock_tick()
     wifi_ok = connect_wifi(show=True)
     if wifi_ok:
         synced = ntp_set_rtc()
@@ -819,6 +852,7 @@ try:
             screen = 'clock'
 
         render(screen)
+        dock_tick()
 
         if mono_ms() - last_net >= 1000 and mono_ms() - last_input >= NET_QUIET_MS:
             last_net = mono_ms()

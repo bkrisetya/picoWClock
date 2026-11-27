@@ -12,6 +12,7 @@ Usage: python3 tests/host_sim.py
 import builtins
 import calendar
 import io
+import importlib.util
 import json
 import os
 import re
@@ -20,6 +21,8 @@ import sys
 import time as ctime
 import traceback
 import types
+
+sys.dont_write_bytecode = True
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MAIN = os.path.join(HERE, '..', 'main.py')
@@ -58,9 +61,36 @@ class MemFile(io.StringIO):
 
 
 def fake_open(path, mode='r', *args, **kwargs):
-    if 'w' in mode:
-        return MemFile(path)
+    if 'w' in mode or 'a' in mode:
+        f = MemFile(path)
+        if 'a' in mode:
+            f.write(written.get(path, ''))
+        return f
+    if path in written:
+        return io.StringIO(written[path])
     return builtins.open(path, mode, *args, **kwargs)
+
+
+# Load the actual history module, but keep its files in the simulated flash.
+_spec = importlib.util.spec_from_file_location('docklog', os.path.join(HERE, '..', 'docklog.py'))
+assert _spec is not None and _spec.loader is not None
+history_module = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(history_module)
+setattr(history_module, 'open', fake_open)
+
+
+def history_stat(path):
+    if path not in written:
+        raise FileNotFoundError(path)
+    return (0, 0, 0, 0, 0, 0, len(written[path]))
+
+
+def history_rename(src, dst):
+    written[dst] = written.pop(src)
+
+
+setattr(history_module, 'os', types.SimpleNamespace(stat=history_stat, rename=history_rename))
+sys.modules['docklog'] = history_module
 
 
 # ---------------- fake time ----------------
@@ -138,6 +168,16 @@ machine.Pin = Pin
 machine.RTC = RTC
 machine.disable_irq = lambda: 0
 machine.enable_irq = lambda state: None
+usb_status = {'value': 0x40051005}
+
+
+class USBRegisters:
+    def __getitem__(self, address):
+        assert address == 0x50110050, 'USB observation must only read SIE_STATUS'
+        return usb_status['value']
+
+
+setattr(machine, 'mem32', USBRegisters())
 
 
 def board_reset():
@@ -699,6 +739,38 @@ def scenario():
     for k in ('joinable', 'flaky_every', 'flaky_n'):
         del net_state[k]
     checks.append('weak join: a network accepting 1 in 4 joins is up within 20 s')
+
+    # Drive the real application loop through the history module and flash.
+    def history_rows():
+        return [json.loads(line) for line in written.get('./dock-history.jsonl', '').splitlines()
+                if line.strip()]
+    rows = history_rows()
+    assert rows and rows[-1]['event'] == 'up', 'main loop does not record USB activity'
+    assert rows[0]['utc'] is None and any(r['event'] == 'time_anchor' for r in rows)
+    before = (id(g['focus']), g['screen'], len(led_rgb))
+    usb_status['value'] |= 0x10
+    run_for(2000)
+    assert history_rows()[-1]['event'] == 'down', history_rows()
+    usb_status['value'] &= ~0x10
+    run_for(2000)
+    assert history_rows()[-1]['event'] == 'up'
+    assert before == (id(g['focus']), g['screen'], len(led_rgb)), 'history changes the clock UI or timer'
+    checks.append('USB history: real loop records up/down and time anchor silently')
+
+    def history_write_failure(*args, **kwargs):
+        raise OSError('simulated flash full')
+    setattr(history_module, 'open', history_write_failure)
+    usb_status['value'] |= 0x10
+    try:
+        run_for(2000)
+        assert 'simulated flash full' in g['dock_log'].error
+        press(B)
+        assert texts()[0].isalpha(), 'buttons must still work after logging fails'
+        press(A)
+    finally:
+        setattr(history_module, 'open', fake_open)
+        usb_status['value'] &= ~0x10
+    checks.append('USB history: flash failure disables only logging, buttons still work')
 
     # Crash guard: an unexpected error is logged and the board restarts
     # instead of freezing on its last frame.

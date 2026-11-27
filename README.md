@@ -79,10 +79,38 @@ November 2026. Divergence from upstream:
 - The pack's RGB LED is driven off at boot (unconfigured, the GPIO
   pull-downs make the red die glow).
 
+## Quiet USB activity history
+
+The Pico records only timestamps for its own USB link becoming **up** (connected
+and not suspended) or **down** (disconnected or suspended). It does not identify
+people or computers, inspect traffic, change the display, or send alerts.
+No computer-side service is required.
+
+History stays on the board in `dock-history.jsonl` and
+`dock-history.previous.jsonl`, at most 16 KiB each. Old records rotate out by
+size. Records contain a run number, non-wrapping monotonic milliseconds, UTC
+when available, and an event: `start`, `up`, `down`, or `time_anchor`. An early
+record with `utc: null` can be related to a later time anchor **in the same
+run**. Never assign it the reset RTC's 2021 date.
+
+Sleep or selective suspend can look like downtime; this is **not proof of a
+physical unplug or someone using the dock**. Short transitions under one second
+are ignored. Existing blocking network calls can delay samples. A power cut
+cannot write its own final event, so a restart marks an observation gap, not an
+exact recorded shutdown time. This is a convenience log, not a security audit.
+
+Ask Hermes for the history when the Pico is temporarily accessible over USB.
+Retrieval uses the state-preserving diagnostic workflow, without resetting the
+clock or running a host updater. The two JSONL files are the complete local
+record; no remote reporting service has been installed. A logger failure stops
+only history for that run; `dock_log.error` or `dock_log_error` is readable during
+diagnostics while the clock continues.
+
 ## Test on the host
 
 ```sh
-python3 tests/host_sim.py
+python3 -I tests/docklog_sim.py
+python3 -I tests/host_sim.py
 ```
 
 Runs the real `main.py` under CPython against stubbed board modules
@@ -95,9 +123,15 @@ checked against real pixels. Run it before every deploy.
 
 ## Deploy
 
+These reset-based commands are for a fresh board or an explicitly approved
+restart. For an in-use clock, use the state-preserving diagnostic deployment
+instead: verify staged hashes, replace atomically and resume only the existing
+main loop, without replaying startup or resetting the RTC/timer.
+
 ```sh
 TTY=$(readlink -f /dev/serial/by-id/usb-MicroPython_Board_in_FS_mode_*-if00)
 mpremote connect "$TTY" cp main.py :/main.py
+mpremote connect "$TTY" cp docklog.py :/docklog.py
 mpremote connect "$TTY" cp WIFI_CONFIG.py :/WIFI_CONFIG.py
 mpremote connect "$TTY" reset
 ```
