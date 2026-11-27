@@ -5,6 +5,10 @@ Desk clock on a Raspberry Pi Pico 2 W + Pimoroni Display Pack 1.14"
 
 White with a teal accent throughout.
 
+The Pico obtains time and weather over its own Wi-Fi. USB supplies power
+and is used for temporary programming or diagnostics only; no computer-side
+updater or service is required.
+
 ![Clock, date, focus timer and weather screens, captured from the board's framebuffer](docs/screens.png)
 
 - **A** clock (default): hours white on top, minutes teal below, each
@@ -27,8 +31,8 @@ White with a teal accent throughout.
   3 s). A reading older than 3 hours shows `No data`.
 
 Any screen other than the clock returns to it after 20 s without a press,
-except while the timer is running. Time comes from the connected USB host
-or NTP, with UK GMT/BST handling. From 22:00 to 07:00 UK time the backlight dims (0.55 to 0.15)
+except while the timer is running. Time comes from NTP with UK GMT/BST
+handling. From 22:00 to 07:00 UK time the backlight dims (0.55 to 0.15)
 and the finished-timer glow is dimmer too; the hours and levels are
 constants at the top of `main.py`.
 
@@ -67,42 +71,18 @@ November 2026. Divergence from upstream:
   carries only public coordinates and no key.
 - RTC stays in UTC; BST is applied at render time (last Sunday March
   01:00 UTC to last Sunday October 01:00 UTC).
-- The board has no battery-backed clock: after power loss it shows
-  `-- / --` until its USB host supplies time or a known network reaches NTP.
+- The board has no battery-backed clock: after any power loss it shows
+  `-- / --` until it reaches a known network and NTP.
 - Failed WiFi/NTP no longer demands a reboot: background rejoins cycle
   through the known networks without blanking the face or blocking the
   buttons, and NTP resyncs every 6 hours.
 - The pack's RGB LED is driven off at boot (unconfigured, the GPIO
   pull-downs make the red die glow).
 
-## USB fallback on bk-air
-
-The existing USB cable carries time and weather as well as power. The
-finite native macOS job `org.setyamarta.pico-clock-usb` runs every 30 s
-while bk-air is awake. It sends UTC, then fetches London weather over
-HTTPS if the board requests it. The helper uses the Python standard
-library, identifies this Pico by USB serial, and never sends a reset or
-interrupt. No credentials cross USB.
-
-While updates arrive, on-board network calls are suppressed. If they stop
-for 90 s, the board resumes its original WiFi/NTP path. The timer uses
-monotonic time and is not changed by a time correction. Weather refreshes
-every 15 min; a second Y press requests it at the next host run (within
-about 30 s). Last weather data expires after 3 h. If the Mac sleeps or is
-disconnected, the clock keeps ticking while the Pico has power, but no
-new USB updates arrive. The Mac must have internet for fresh weather.
-
-Implementation: `usb_host.py` on the board and `host/usb_clock.py` as
-`~/bin/pico-clock-usb.py` on bk-air. The helper keeps one bounded receipt under
-`~/Library/Application Support/pico-clock/receipt.json`. See
-[the decision and protocol](docs/plans/usb-fallback.md).
-
 ## Test on the host
 
 ```sh
-python3 -I tests/host_sim.py
-python3 -I tests/usb_sim.py
-python3 -I host/test_usb_clock.py
+python3 tests/host_sim.py
 ```
 
 Runs the real `main.py` under CPython against stubbed board modules
@@ -117,7 +97,6 @@ checked against real pixels. Run it before every deploy.
 
 ```sh
 TTY=$(readlink -f /dev/serial/by-id/usb-MicroPython_Board_in_FS_mode_*-if00)
-mpremote connect "$TTY" cp usb_host.py :/usb_host.py
 mpremote connect "$TTY" cp main.py :/main.py
 mpremote connect "$TTY" cp WIFI_CONFIG.py :/WIFI_CONFIG.py
 mpremote connect "$TTY" reset

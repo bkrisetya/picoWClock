@@ -341,14 +341,6 @@ for name, mod in (('utime', utime), ('machine', machine), ('network', network),
                   ('pimoroni', pimoroni), ('WIFI_CONFIG', wifi_config)):
     sys.modules[name] = mod
 
-# Load the real companion module without relying on cwd or PYTHONPATH (-I).
-import importlib.util
-_usb_spec = importlib.util.spec_from_file_location('usb_host', os.path.join(HERE, '..', 'usb_host.py'))
-assert _usb_spec is not None and _usb_spec.loader is not None
-_usb_module = importlib.util.module_from_spec(_usb_spec)
-_usb_spec.loader.exec_module(_usb_module)
-sys.modules['usb_host'] = _usb_module
-
 
 # ---------------- scenario ----------------
 def texts():
